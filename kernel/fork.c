@@ -111,6 +111,11 @@
 #include <linux/tick.h>
 #include <linux/unwind_deferred.h>
 #include <linux/pgalloc.h>
+
+#ifdef CONFIG_USER_NS
+#include <linux/user_namespace.h>
+#endif
+
 #include <linux/uaccess.h>
 
 #include <asm/mmu_context.h>
@@ -2041,6 +2046,10 @@ __latent_entropy struct task_struct *copy_process(
 	if ((clone_flags & (CLONE_NEWUSER|CLONE_FS)) == (CLONE_NEWUSER|CLONE_FS))
 		return ERR_PTR(-EINVAL);
 
+	if (!unprivileged_userns_clone && (clone_flags & CLONE_NEWUSER))
+		if (!capable(CAP_SYS_ADMIN))
+			return ERR_PTR(-EPERM);
+
 	/*
 	 * Thread groups must share signals as well, and detached threads
 	 * can only be started up within the thread group.
@@ -3284,6 +3293,12 @@ int ksys_unshare(unsigned long unshare_flags)
 	/* No unsharing with overriden fs state */
 	VFS_WARN_ON_ONCE(unshare_flags & (CLONE_NEWNS | CLONE_FS) &&
 			 current->fs != current->real_fs);
+
+	if (!unprivileged_userns_clone && (unshare_flags & CLONE_NEWUSER)) {
+		err = -EPERM;
+		if (!capable(CAP_SYS_ADMIN))
+			goto bad_unshare_out;
+	}
 
 	err = check_unshare_flags(unshare_flags);
 	if (err)

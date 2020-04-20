@@ -1340,6 +1340,7 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
 		init_waitqueue_head(&pgdat->reclaim_wait[i]);
 
 	lruvec_init(&pgdat->__lruvec);
+	pgdat->kswapd_waiters = (atomic_t)ATOMIC_INIT(0);
 }
 
 static void __meminit zone_init_internals(struct zone *zone, enum zone_type idx, int nid,

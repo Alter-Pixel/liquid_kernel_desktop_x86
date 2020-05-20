@@ -808,6 +808,7 @@ static inline void init_compound_tail(struct page *tail,
 	prep_compound_tail(tail, head, order);
 }
 
+extern atomic_long_t kswapd_waiters;
 #if defined CONFIG_COMPACTION || defined CONFIG_CMA
 
 /*

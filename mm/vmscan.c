@@ -4123,7 +4123,7 @@ static bool lruvec_is_reclaimable(struct lruvec *lruvec, struct scan_control *sc
 }
 
 /* to protect the working set of the last N jiffies */
-static unsigned long lru_gen_min_ttl __read_mostly;
+static unsigned long lru_gen_min_ttl __read_mostly = HZ * 2;
 
 static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 {

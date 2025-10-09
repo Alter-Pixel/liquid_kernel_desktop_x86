@@ -79,7 +79,11 @@ unsigned int sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_LOG;
 unsigned int sysctl_sched_base_slice			= 700000ULL;
 static unsigned int normalized_sysctl_sched_base_slice	= 700000ULL;
 
+#ifdef CONFIG_SCHED_CASH
+__read_mostly unsigned int sysctl_sched_migration_cost	= 1000000UL;
+#else
 __read_mostly unsigned int sysctl_sched_migration_cost	= 500000UL;
+#endif
 
 static int __init setup_sched_thermal_decay_shift(char *str)
 {
@@ -10206,6 +10210,10 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 	struct cfs_rq *cfs_rq;
 	struct sched_entity *nse = NULL;
 
+#ifdef CONFIG_SCHED_CASH
+	smp_store_release(&prev->last_ts, sched_clock());
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	if (next && next->sched_class == &fair_sched_class)
 		nse = &next->se;
@@ -13946,6 +13954,10 @@ static int __active_load_balance_cpu_stop(void *data, unsigned int lb_flags)
 	/* Search for an sd spanning us and the target CPU. */
 	rcu_read_lock();
 	for_each_domain(target_cpu, sd) {
+#ifdef CONFIG_SCHED_CASH
+		if (sd->flags & SD_SHARE_CPUCAPACITY)
+			continue;
+#endif
 		if (cpumask_test_cpu(busiest_cpu, sched_domain_span(sd)))
 			break;
 	}
@@ -14098,6 +14110,10 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 		 */
 		need_decay = update_newidle_cost(sd, 0, 0);
 		max_cost += sd->max_newidle_lb_cost;
+#ifdef CONFIG_SCHED_CASH
+		if (sd->flags & SD_SHARE_CPUCAPACITY)
+			continue;
+#endif
 
 		/*
 		 * Stop the load balance at this level. There is another
@@ -14722,6 +14738,10 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 	for_each_domain(this_cpu, sd) {
 		u64 domain_cost;
 
+#ifdef CONFIG_SCHED_CASH
+		if (sd->flags & SD_SHARE_CPUCAPACITY)
+			continue;
+#endif
 		update_next_balance(sd, &next_balance);
 
 		if (this_rq->avg_idle < curr_cost + sd->max_newidle_lb_cost)
@@ -15664,6 +15684,10 @@ static unsigned int get_rr_interval_fair(struct rq *rq, struct task_struct *task
 	return rr_interval;
 }
 
+#ifdef CONFIG_SCHED_CASH
+#include "cash.c"
+#endif
+
 /*
  * All the scheduling class methods:
  */
@@ -15679,7 +15703,12 @@ DEFINE_SCHED_CLASS(fair) = {
 	.put_prev_task		= put_prev_task_fair,
 	.set_next_task          = set_next_task_fair,
 
+	.balance		= balance_fair,
+#ifdef CONFIG_SCHED_CASH
+	.select_task_rq		= cash_select_task_rq_fair,
+#else
 	.select_task_rq		= select_task_rq_fair,
+#endif
 	.migrate_task_rq	= migrate_task_rq_fair,
 
 	.rq_online		= rq_online_fair,

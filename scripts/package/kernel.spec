@@ -3,7 +3,7 @@
 %{!?make: %define make make}
 %define makeflags %{?_smp_mflags} ARCH=%{ARCH}
 
-Name: kernel
+Name: kernel-liquid
 Summary: The Linux Kernel
 Version: %(echo %{KERNELRELEASE} | sed -e 's/-/_/g')
 Release: %{pkg_release}%{?dist}
@@ -41,7 +41,7 @@ glibc package.
 Summary: Development package for building kernel modules to match the %{version} kernel
 Group: System Environment/Kernel
 AutoReqProv: no
-%description -n kernel-devel
+%description -n kernel-liquid-devel
 This package provides kernel headers and makefiles sufficient to build modules
 against the %{version} kernel package.
 %endif

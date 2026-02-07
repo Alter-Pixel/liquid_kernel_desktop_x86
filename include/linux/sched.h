@@ -894,6 +894,9 @@ struct task_struct {
 
 #ifdef CONFIG_SCHED_CASH
 	u64				last_ts;
+	int				cash_warm_cpu;	  /* CPU where cache is warm */
+	u64				cash_warm_until;  /* timestamp when cache goes cold */
+	u32				cash_migrations;  /* migration count for stats */
 #endif
 
 #ifdef CONFIG_CGROUP_SCHED

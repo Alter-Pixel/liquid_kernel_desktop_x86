@@ -4589,6 +4589,9 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->on_rq			= 0;
 #ifdef CONFIG_SCHED_CASH
 	p->last_ts			= 0;
+	p->cash_warm_cpu		= -1;
+	p->cash_warm_until		= 0;
+	p->cash_migrations		= 0;
 #endif
 
 	p->se.on_rq			= 0;

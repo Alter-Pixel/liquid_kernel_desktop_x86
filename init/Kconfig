@@ -1510,10 +1510,32 @@ config SCHED_AUTOGROUP
 
 config SCHED_CASH
 	bool "Cache-Aware Scheduling Heuristic"
-	depends on X86_64_SMP
+	depends on X86_64 && SMP
 	depends on !SCHED_CORE
 	depends on !CPUMASK_OFFSTACK
 	depends on !ENERGY_MODEL
+	help
+	  Enable Cache-Aware Scheduling Heuristic (CASH) for improved task
+	  placement based on CPU cache locality. CASH reduces cache misses
+	  by preferring to schedule tasks on CPUs where their data is still
+	  warm in cache.
+
+	  Features:
+	  - Per-task cache warmness tracking
+	  - SMT sibling preference (same physical core = hot L1/L2)
+	  - Cluster/CCX awareness for AMD Zen and Intel hybrid CPUs
+	  - Dynamic scheduling group factors with EWMA smoothing
+	  - Statistics at /proc/sched_cash_stats (write to reset)
+
+	  Tunables via /proc/sys/kernel/:
+	  - sched_cash_aggro_ns:  aggressive cache-hot threshold (5ms)
+	  - sched_cash_tempo_ns:  moderate cache-hot threshold (12ms)
+	  - sched_cash_warm_ns:   cache warm window duration (20ms)
+	  - sched_cash_smt_bonus: score bonus for SMT siblings
+	  - sched_cash_cluster_bonus: score bonus for same cluster
+
+	  This is ideal for desktop, gaming, and latency-sensitive workloads.
+	  If unsure, say Y for desktop systems with multi-core CPUs.
 
 config RELAY
 	bool "Kernel->user space relay support (formerly relayfs)"

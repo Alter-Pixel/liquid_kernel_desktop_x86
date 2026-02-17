@@ -14,7 +14,8 @@ URL: https://www.kernel.org
 Source0: linux.tar.gz
 Source1: config
 Source2: diff.patch
-Provides: kernel-uname-r = %{version}
+Provides: kernel-modules-uname-r = %{KERNELRELEASE}
+Provides: kernel-uname-r = %{KERNELRELEASE}
 Provides: kernel-%{KERNELRELEASE}
 BuildRequires: bc binutils bison dwarves
 BuildRequires: (elfutils-devel or libdw-devel)
@@ -41,6 +42,8 @@ glibc package.
 Summary: Development package for building kernel modules to match the %{version} kernel
 Group: System Environment/Kernel
 AutoReqProv: no
+Provides: kernel-devel-uname-r = %{KERNELRELEASE}
+Provides: kernel-devel = %{version}
 %description -n kernel-liquid-devel
 This package provides kernel headers and makefiles sufficient to build modules
 against the %{version} kernel package.

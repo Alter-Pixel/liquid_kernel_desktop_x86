@@ -299,6 +299,12 @@ static int teo_find_shallower_state(struct cpuidle_driver *drv,
 	return state_idx;
 }
 
+static bool teo_state_ok(int i, struct cpuidle_driver *drv)
+{
+	return !tick_nohz_tick_stopped() ||
+		drv->states[i].target_residency_ns >= TICK_NSEC;
+}
+
 static int teo_get_candidate(struct cpuidle_driver *drv,
 			     struct cpuidle_device *dev,
 			     struct teo_cpu *cpu_data, int constraint_idx,

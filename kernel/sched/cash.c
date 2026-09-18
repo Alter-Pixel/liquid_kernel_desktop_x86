@@ -173,10 +173,15 @@ static inline bool cash_same_cluster(int cpu1, int cpu2)
 
 static struct cpumask *cash_best_group(int cpu, struct cpumask *scope)
 {
-	struct cash_group cand, best;
+	struct cash_group cand = {};
+	struct cash_group best = {};
 	struct sched_group *start;
 
-	cand.groups = start = per_cpu(cash_sg_ptr, cpu);
+	start = per_cpu(cash_sg_ptr, cpu);
+	cand.groups = start;
+	if (unlikely(!start))
+		return NULL;
+		
 	best.factor = -SCHED_CAPACITY_SCALE;
 
 	do {
@@ -184,11 +189,14 @@ static struct cpumask *cash_best_group(int cpu, struct cpumask *scope)
 			continue;
 
 		cand.factor = READ_ONCE(cand.groups->factor);
-		if (cand.factor * 100 > best.factor * 125) {
+		if (cand.factor > best.factor) {
 			best.factor = cand.factor;
 			best.groups = cand.groups;
 		}
 	} while ((cand.groups = cand.groups->next) != start);
+
+	if (unlikely(!best.groups))
+		return NULL;
 
 	return sched_group_span(best.groups);
 }
@@ -202,7 +210,12 @@ static struct cpumask *cash_find_group(int cpu, int wake_flags, struct cpumask *
 			return mask;
 	}
 
-	return cash_best_group(cpu, scope);
+	mask = cash_best_group(cpu, scope);
+
+	if (!mask)
+		return scope;
+
+	return mask;
 }
 
 static int cash_cpu_online(unsigned int cpu)
@@ -272,6 +285,8 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu, int wak
 
 	now = sched_clock();
 	warm_cpu = READ_ONCE(p->cash_warm_cpu);
+	if (warm_cpu < 0 || warm_cpu >= nr_cpu_ids)
+		warm_cpu = -1;
 
 	if (wake_flags & WF_TTWU) {
 		u64 delta = now - smp_load_acquire(&p->last_ts);
@@ -340,6 +355,16 @@ rescan:
 			best.cpu = cpu;
 			best.factor = factor;
 		}
+	}
+
+	if (unlikely(best.cpu < 0)) {
+		if (prev_cpu >= 0 && cpumask_test_cpu(prev_cpu, m_scope))
+			best.cpu = prev_cpu;
+		else
+			best.cpu = cpumask_first(m_scope);
+
+		if (unlikely(best.cpu < 0 || best.cpu >= nr_cpu_ids))
+			return select_task_rq_fair(p, prev_cpu, wake_flags);
 	}
 
 	if (aggro && (best.factor - p_est < 64L)) {

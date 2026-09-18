@@ -25,6 +25,8 @@ static unsigned int sched_cash_cluster_bonus __read_mostly = 64;
 
 static DEFINE_PER_CPU(struct sched_group *, cash_sg_ptr);
 static DEFINE_PER_CPU(struct sched_domain *, cash_cluster_sd);
+static DEFINE_PER_CPU(cpumask_var_t, cash_scope_mask);
+static DEFINE_PER_CPU(cpumask_var_t, cash_group_mask);
 bool cash_up __read_mostly;
 bool cash_sg __read_mostly;
 static bool cash_has_clusters __read_mostly;
@@ -255,7 +257,8 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu, int wak
 	if (unlikely(!READ_ONCE(cash_up)))
 		return select_task_rq_fair(p, prev_cpu, wake_flags);
 
-	struct cpumask m_group, m_scope;
+	struct cpumask *m_group = this_cpu_cpumask_var_ptr(cash_group_mask);
+	struct cpumask *m_scope = this_cpu_cpumask_var_ptr(cash_scope_mask);
 	struct cash_cpu best;
 	unsigned int p_est;
 	int cpu, p_cpu, p_que;
@@ -373,10 +376,25 @@ rescan:
 	return best.cpu;
 }
 
+static bool cash_hp_registered __read_mostly;
+
 void sched_cash_init(void)
 {
 	int cpu;
 	int ret;
+
+	if (cash_hp_registered)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		if (!zalloc_cpumask_var_node(&per_cpu(cash_scope_mask, cpu),
+					     GFP_KERNEL, cpu_to_node(cpu)) ||
+		    !zalloc_cpumask_var_node(&per_cpu(cash_group_mask, cpu),
+					     GFP_KERNEL, cpu_to_node(cpu))) {
+			pr_err("sched_cash: failed to allocate scratch cpumasks\n");
+			return;
+		}
+	}
 
 	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "sched/cash:online", cash_cpu_online, cash_cpu_offline);
 	if (ret < 0)
@@ -384,7 +402,7 @@ void sched_cash_init(void)
 		pr_err("sched_cash: failed to register CPU hotplug state\n");
 		return;
 	}
-
+	cash_hp_registered = true;
 	WRITE_ONCE(cash_up, true);
 	pr_info("sched_cash: initialized via cpuhp\n");
 }

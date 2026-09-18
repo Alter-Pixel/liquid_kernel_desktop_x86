@@ -50,6 +50,41 @@ static void cash_stats_sum(struct cash_stats *out)
 	}
 }
 
+/*
+ * Per-path instrumentation for the WF_SYNC branch in
+ * cash_select_task_rq_fair(). cash_account()/cash_stats alone can't
+ * distinguish "returned prev_cpu because it was idle" from "returned
+ * this_cpu because it was contended" - both look identical in the
+ * aggregate stats (chosen_cpu == warm_cpu in both cases). These counters
+ * make that visible.
+ */
+enum cash_wfsync_path {
+	CASH_WFSYNC_PREV_IDLE = 0,
+	CASH_WFSYNC_THIS_BUSY,
+	CASH_WFSYNC_DEFER_CFS,
+	CASH_WFSYNC_PATH_MAX,
+};
+
+static DEFINE_PER_CPU(unsigned long[CASH_WFSYNC_PATH_MAX], cash_wfsync_hits);
+
+static inline void cash_wfsync_hit(enum cash_wfsync_path path)
+{
+	this_cpu_inc(cash_wfsync_hits[path]);
+}
+
+static void cash_wfsync_sum(unsigned long out[CASH_WFSYNC_PATH_MAX])
+{
+	int cpu, i;
+
+	memset(out, 0, sizeof(unsigned long) * CASH_WFSYNC_PATH_MAX);
+	for_each_possible_cpu(cpu) {
+		unsigned long *hits = per_cpu(cash_wfsync_hits, cpu);
+
+		for (i = 0; i < CASH_WFSYNC_PATH_MAX; i++)
+			out[i] += hits[i];
+	}
+}
+
 /* Single point of truth for cash_stats accounting. */
 static inline void cash_account(int cache_state, int chosen_cpu, int prev_cpu,
 			       int warm_cpu, bool multi_cluster)
@@ -391,7 +426,10 @@ static int cash_proc_show(struct seq_file *m, void *v)
 {
 	struct cash_stats snap;
 
+	unsigned long wfsync[CASH_WFSYNC_PATH_MAX];
+
 	cash_stats_sum(&snap);
+	cash_wfsync_sum(wfsync);
 
 	seq_printf(m, "total_placements %llu\n", snap.total_placements);
 	seq_printf(m, "smt_hits %llu\n", snap.smt_hits);
@@ -408,6 +446,9 @@ static int cash_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "enabled %d\n", READ_ONCE(cash_up));
 	seq_printf(m, "groups %d\n", READ_ONCE(cash_sg));
 	seq_printf(m, "clusters %d\n", READ_ONCE(cash_has_clusters));
+	seq_printf(m, "wfsync_prev_idle %lu\n", wfsync[CASH_WFSYNC_PREV_IDLE]);
+	seq_printf(m, "wfsync_this_busy %lu\n", wfsync[CASH_WFSYNC_THIS_BUSY]);
+	seq_printf(m, "wfsync_defer_cfs %lu\n", wfsync[CASH_WFSYNC_DEFER_CFS]);
 
 	return 0;
 }

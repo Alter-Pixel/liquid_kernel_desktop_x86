@@ -4,6 +4,17 @@
  *  Copyright (C) 2025 shygosh <shygosh@proton.me>
  *  Copyright (C) 2025 UsiFX <xprjkts@gmail.com>
  */
+#include <linux/cpuhotplug.h>
+#include <linux/topology.h>
+#include <linux/sched/topology.h>
+
+#ifndef SD_SHARE_LLC
+#ifdef SD_SHARE_PKG_RESOURCES
+#define SD_SHARE_LLC SD_SHARE_PKG_RESOURCES
+#else
+#define SD_SHARE_LLC 0
+#endif
+#endif
 
 static unsigned int sched_cash_aggro_ns __read_mostly = 5000000;
 static unsigned int sched_cash_tempo_ns __read_mostly = 12000000;
@@ -150,16 +161,12 @@ static inline void cash_update_warmness(struct task_struct *p, int cpu)
 
 static inline bool cash_same_cluster(int cpu1, int cpu2)
 {
-	struct sched_domain *sd;
-
-	if (!cash_has_clusters)
+	if (cpu1 < 0 || cpu1 >= nr_cpu_ids || cpu2 < 0 || cpu2 >= nr_cpu_ids)
 		return false;
 
-	sd = per_cpu(cash_cluster_sd, cpu1);
-	if (sd && cpumask_test_cpu(cpu2, sched_domain_span(sd)))
-		return true;
-
-	return false;
+	/* Query native LLC/CCX topology mask directly */
+	return cpumask_test_cpu(cpu2, topology_cluster_cpumask(cpu1)) ||
+	       cpumask_test_cpu(cpu2, cpu_coregroup_mask(cpu1));
 }
 
 static struct cpumask *cash_best_group(int cpu, struct cpumask *scope)
@@ -194,6 +201,53 @@ static struct cpumask *cash_find_group(int cpu, int wake_flags, struct cpumask *
 	}
 
 	return cash_best_group(cpu, scope);
+}
+
+static int cash_cpu_online(unsigned int cpu)
+{
+	struct sched_domain *sd;
+	struct sched_group *sg;
+	bool found_cluster = false;
+	unsigned int smt_weight = cpumask_weight(cpu_smt_mask(cpu));
+
+	rcu_read_lock();
+	for_each_domain(cpu, sd) {
+		/* Match x86 LLC/MC domains as well as ARM SD_CLUSTER */
+		if (sd->flags & (SD_CLUSTER | SD_SHARE_LLC))
+		{
+			per_cpu(cash_cluster_sd, cpu) = sd;
+			found_cluster = true;
+
+			if (sd->groups) {
+				sg = sd->groups;
+				per_cpu(cash_sg_ptr, cpu) = sg;
+				sg->factor = arch_scale_cpu_capacity(cpu);
+
+				if (!READ_ONCE(cash_sg) && per_cpu(cash_sg_ptr, cpu))
+				{
+					if (cpumask_weight(sched_group_span(per_cpu(cash_sg_ptr, cpu))) > smt_weight)
+						WRITE_ONCE(cash_sg, true);
+				}
+			}
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	if (found_cluster || cpumask_weight(topology_cluster_cpumask(cpu)) > 1)
+		WRITE_ONCE(cash_has_clusters, true);
+
+	pr_info("sched_cash: CPU %d online | cluster=%d | sg_weight=%u\n", cpu, READ_ONCE(cash_has_clusters), per_cpu(cash_sg_ptr, cpu) ? cpumask_weight(sched_group_span(per_cpu(cash_sg_ptr, cpu))) : 0);
+
+	return 0;
+}
+
+static int cash_cpu_offline(unsigned int cpu)
+{
+	per_cpu(cash_sg_ptr, cpu) = NULL;
+	per_cpu(cash_cluster_sd, cpu) = NULL;
+	pr_info("sched_cash: CPU %d offline and structures cleared\n", cpu);
+	return 0;
 }
 
 static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
@@ -321,55 +375,18 @@ rescan:
 
 void sched_cash_init(void)
 {
-	struct sched_domain *sd, *tmp, *cluster_sd;
-	struct sched_group *sg;
-	int cpu = smp_processor_id();
-	int i;
+	int cpu;
+	int ret;
 
-	for_each_domain(cpu, tmp) {
-		sd = tmp;
+	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "sched/cash:online", cash_cpu_online, cash_cpu_offline);
+	if (ret < 0)
+	{
+		pr_err("sched_cash: failed to register CPU hotplug state\n");
+		return;
 	}
 
-	/* Cache cluster domain pointers for all CPUs */
-	for_each_possible_cpu(i) {
-		cluster_sd = NULL;
-		for_each_domain(i, tmp) {
-			if (tmp->flags & SD_CLUSTER) {
-				cluster_sd = tmp;
-				break;
-			}
-		}
-		per_cpu(cash_cluster_sd, i) = cluster_sd;
-		if (cluster_sd && i == cpu)
-			WRITE_ONCE(cash_has_clusters, true);
-	}
-
-	sg = sd->groups;
-
-	do {
-		cpu = cpumask_first(sched_group_span(sg));
-		sg->factor = arch_scale_cpu_capacity(cpu);
-		for_each_cpu(cpu, sched_group_span(sg)) {
-			per_cpu(cash_sg_ptr, cpu) = sg;
-		}
-	} while ((sg = sg->next) != sd->groups);
-
-	do {
-		cpu = cpumask_first(sched_group_span(sg));
-		if (cpumask_weight(sched_group_span(sg)) >
-		    cpumask_weight(cpu_smt_mask(cpu))) {
-			WRITE_ONCE(cash_sg, true);
-			break;
-		}
-	} while ((sg = sg->next) != sd->groups);
-
-	smp_mb();
-	pr_info("sched_cash: enabled=%s clusters=%s\n",
-		READ_ONCE(cash_sg) ? "true" : "false",
-		READ_ONCE(cash_has_clusters) ? "true" : "false");
-	pr_info("sched_cash: domain weight=%u level=%d flags=0x%x\n",
-		sd->span_weight, sd->level, sd->flags);
 	WRITE_ONCE(cash_up, true);
+	pr_info("sched_cash: initialized via cpuhp\n");
 }
 
 #ifdef CONFIG_SYSCTL

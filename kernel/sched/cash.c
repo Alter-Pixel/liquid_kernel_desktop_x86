@@ -18,7 +18,7 @@
 
 static unsigned int sched_cash_aggro_ns __read_mostly = 5000000;
 static unsigned int sched_cash_tempo_ns __read_mostly = 12000000;
-static unsigned int sched_cash_warm_ns  __read_mostly = 20000000;
+static unsigned int sched_cash_warm_ns __read_mostly = 20000000;
 static unsigned int sched_cash_smt_bonus __read_mostly = 128;
 static unsigned int sched_cash_cluster_bonus __read_mostly = 64;
 
@@ -32,13 +32,13 @@ bool cash_sg __read_mostly;
 static bool cash_has_clusters __read_mostly;
 
 struct cash_stats {
-	u64	total_placements;
-	u64	smt_hits;
-	u64	cluster_hits;
-	u64	cache_hot;
-	u64	cache_warm;
-	u64	cache_cold;
-	u64	migrations;
+	u64 total_placements;
+	u64 smt_hits;
+	u64 cluster_hits;
+	u64 cache_hot;
+	u64 cache_warm;
+	u64 cache_cold;
+	u64 migrations;
 };
 
 static DEFINE_PER_CPU(struct cash_stats, cash_stats);
@@ -98,31 +98,9 @@ static void cash_wfsync_sum(unsigned long out[CASH_WFSYNC_PATH_MAX])
 	}
 }
 
-/* Single point of truth for cash_stats accounting. */
-static inline void cash_account(int cache_state, int chosen_cpu, int prev_cpu,
-			       int warm_cpu, bool multi_cluster)
+static inline void cash_inc_migrations(struct task_struct *p)
 {
-	struct cash_stats *s = this_cpu_ptr(&cash_stats);
-
-	s->total_placements++;
-
-	if (cache_state == 2)
-		s->cache_hot++;
-	else if (cache_state == 1)
-		s->cache_warm++;
-	else
-		s->cache_cold++;
-
-	if (warm_cpu >= 0)
-	{
-		if (cpumask_test_cpu(chosen_cpu, cpu_smt_mask(warm_cpu)))
-			s->smt_hits++;
-		if (multi_cluster && cash_same_cluster(chosen_cpu, warm_cpu))
-			s->cluster_hits++;
-	}
-
-	if (chosen_cpu != prev_cpu)
-		s->migrations++;
+	WRITE_ONCE(p->cash_migrations, READ_ONCE(p->cash_migrations) + 1);
 }
 
 struct cash_cpu {
@@ -138,13 +116,15 @@ struct cash_group {
 /* Returns: 2 = hot, 1 = warm, 0 = cold */
 static inline int cash_cache_state(struct task_struct *p, int cpu, u64 now)
 {
+	int warm_cpu = READ_ONCE(p->cash_warm_cpu);
+	u64 warm_until = READ_ONCE(p->cash_warm_until);
 	u64 delta;
 
-	if (p->cash_warm_cpu != cpu || p->cash_warm_until == 0)
+	if (warm_cpu != cpu || warm_until == 0)
 		return 0;
 
-	if (now < p->cash_warm_until) {
-		delta = p->cash_warm_until - now;
+	if (now < warm_until) {
+		delta = warm_until - now;
 		if (delta > (sched_cash_warm_ns >> 1))
 			return 2;
 		return 1;
@@ -157,9 +137,10 @@ static inline void cash_update_warmness(struct task_struct *p, int cpu)
 {
 	u64 now = sched_clock();
 
-	p->cash_warm_cpu = cpu;
-	p->cash_warm_until = now + sched_cash_warm_ns;
+	WRITE_ONCE(p->cash_warm_cpu, cpu);
+	WRITE_ONCE(p->cash_warm_until, now + sched_cash_warm_ns);
 }
+
 
 static inline bool cash_same_cluster(int cpu1, int cpu2)
 {
@@ -181,7 +162,7 @@ static struct cpumask *cash_best_group(int cpu, struct cpumask *scope)
 	cand.groups = start;
 	if (unlikely(!start))
 		return NULL;
-		
+
 	best.factor = -SCHED_CAPACITY_SCALE;
 
 	do {
@@ -203,11 +184,17 @@ static struct cpumask *cash_best_group(int cpu, struct cpumask *scope)
 
 static struct cpumask *cash_find_group(int cpu, int wake_flags, struct cpumask *scope)
 {
-	if (wake_flags & WF_TTWU) {
-		struct cpumask *mask = sched_group_span(per_cpu(cash_sg_ptr, cpu));
+	struct cpumask *mask;
 
-		if (likely(cpumask_intersects(mask, scope)))
-			return mask;
+	if (wake_flags & WF_TTWU) {
+		struct sched_group *sg = per_cpu(cash_sg_ptr, cpu);
+
+		if (sg) {
+			mask = sched_group_span(sg);
+
+			if (cpumask_intersects(mask, scope))
+				return mask;
+		}
 	}
 
 	mask = cash_best_group(cpu, scope);
@@ -226,7 +213,8 @@ static int cash_cpu_online(unsigned int cpu)
 	unsigned int smt_weight = cpumask_weight(cpu_smt_mask(cpu));
 
 	rcu_read_lock();
-	for_each_domain(cpu, sd) {
+	for_each_domain(cpu, sd)
+	{
 		/* Match x86 LLC/MC domains as well as ARM SD_CLUSTER */
 		if (sd->flags & (SD_CLUSTER | SD_SHARE_LLC))
 		{
@@ -238,8 +226,8 @@ static int cash_cpu_online(unsigned int cpu)
 				per_cpu(cash_sg_ptr, cpu) = sg;
 				sg->factor = arch_scale_cpu_capacity(cpu);
 
-				if (!READ_ONCE(cash_sg) && per_cpu(cash_sg_ptr, cpu))
-				{
+				if (!READ_ONCE(cash_sg) && per_cpu(cash_sg_ptr, cpu)) {
+					/* Enable sched_group fast-path if group span exceeds SMT thread count */
 					if (cpumask_weight(sched_group_span(per_cpu(cash_sg_ptr, cpu))) > smt_weight)
 						WRITE_ONCE(cash_sg, true);
 				}
@@ -265,9 +253,50 @@ static int cash_cpu_offline(unsigned int cpu)
 	return 0;
 }
 
-static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+/*
+ * Single point of truth for cash_stats accounting, called from every
+ * return path in cash_select_task_rq_fair() so total_placements is never
+ * undercounted (the autotuner relies on it as a denominator) and
+ * smt_hits/cluster_hits always mean "the chosen cpu actually shares
+ * SMT/cluster with warm_cpu", not "we took some fast path".
+ *
+ * "migration" is defined consistently here as: chosen_cpu != prev_cpu.
+ */
+static inline void cash_account(int cache_state, int chosen_cpu, int prev_cpu,
+				int warm_cpu, bool multi_cluster)
 {
-	if (unlikely(!READ_ONCE(cash_up)))
+	struct cash_stats *s = this_cpu_ptr(&cash_stats);
+
+	s->total_placements++;
+
+	if (cache_state == 2)
+		s->cache_hot++;
+	else if (cache_state == 1)
+		s->cache_warm++;
+	else
+		s->cache_cold++;
+
+	if (warm_cpu >= 0)
+	{
+		if (cpumask_test_cpu(chosen_cpu, cpu_smt_mask(warm_cpu)))
+			s->smt_hits++;
+		if (multi_cluster && cash_same_cluster(chosen_cpu, warm_cpu))
+			s->cluster_hits++;
+	}
+
+	if (chosen_cpu != prev_cpu)
+		s->migrations++;
+}
+
+static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu,
+				    int wake_flags)
+{
+	/* Acquire cash_up topology state and check global toggle */
+	if (unlikely(!smp_load_acquire(&cash_up) ||
+		     !READ_ONCE(sched_cash_enabled)))
+		return select_task_rq_fair(p, prev_cpu, wake_flags);
+
+	if ((p->flags & PF_KTHREAD) || rt_task(p) || p->prio < DEFAULT_PRIO)
 		return select_task_rq_fair(p, prev_cpu, wake_flags);
 
 	struct cpumask *m_group = this_cpu_cpumask_var_ptr(cash_group_mask);
@@ -277,16 +306,27 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu, int wak
 	int cpu, p_cpu, p_que;
 	int aggro = 0, tempo = 0;
 	int cache_state = 0;
-	int warm_cpu;
+	int warm_cpu, ref_cpu;
+	bool multi_cluster;
 	u64 now;
 
-	if (unlikely(!cpumask_and(&m_scope, cpu_active_mask, p->cpus_ptr)))
+	if (unlikely(!cpumask_and(m_scope, cpu_active_mask, p->cpus_ptr)))
 		return cpumask_first(p->cpus_ptr);
 
-	now = sched_clock();
 	warm_cpu = READ_ONCE(p->cash_warm_cpu);
 	if (warm_cpu < 0 || warm_cpu >= nr_cpu_ids)
 		warm_cpu = -1;
+
+	/* When the task has no valid prev_cpu yet, sample topology near the
+	 * waking cpu instead of an arbitrary fixed cpu 0. */
+	ref_cpu = prev_cpu >= 0 ? prev_cpu : raw_smp_processor_id();
+	multi_cluster = READ_ONCE(cash_has_clusters) &&
+			(cpumask_weight(cpu_coregroup_mask(ref_cpu)) <
+			 num_online_cpus());
+
+	now = sched_clock();
+	if (warm_cpu >= 0 && cpumask_test_cpu(warm_cpu, m_scope))
+		cache_state = cash_cache_state(p, warm_cpu, now);
 
 	if (wake_flags & WF_TTWU) {
 		u64 delta = now - smp_load_acquire(&p->last_ts);
@@ -294,25 +334,81 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu, int wak
 
 		record_wakee(p);
 
-		if (warm_cpu >= 0 && cpumask_test_cpu(warm_cpu, &m_scope))
-			cache_state = cash_cache_state(p, warm_cpu, now);
+		if ((wake_flags & WF_SYNC) &&
+		    cpumask_test_cpu(this_cpu, m_scope)) {
+			if (prev_cpu >= 0 && prev_cpu != this_cpu &&
+			    cpumask_test_cpu(prev_cpu, m_scope) &&
+			    available_idle_cpu(prev_cpu)) {
+				cash_update_warmness(p, prev_cpu);
+				cash_account(cache_state, prev_cpu, prev_cpu,
+					     warm_cpu, multi_cluster);
+				cash_wfsync_hit(CASH_WFSYNC_PREV_IDLE);
+				return prev_cpu;
+			}
+			/*
+				 * prev_cpu is not idle. Only co-locate on this_cpu when it's
+				 * already contended (nr_running > 1) -- in that regime a
+				 * pair sharing the core is ~free and gains locality
+				 * (hackbench). When this_cpu is otherwise idle, defer to
+				 * CFS's wake_affine() load comparison so we don't give up
+				 * real parallelism (sched pipe).
+				 */
+			if (cpu_rq(this_cpu)->nr_running > 1) {
+				cash_update_warmness(p, this_cpu);
+				cash_account(cache_state, this_cpu, prev_cpu,
+					     warm_cpu, multi_cluster);
+				cash_wfsync_hit(CASH_WFSYNC_THIS_BUSY);
+				return this_cpu;
+			}
+			cash_wfsync_hit(CASH_WFSYNC_DEFER_CFS);
+			return select_task_rq_fair(p, prev_cpu, wake_flags);
+		}
 
 		if (unlikely((wake_flags & WF_CURRENT_CPU) &&
-			     cpumask_test_cpu(this_cpu, &m_scope)))
+			     cpumask_test_cpu(this_cpu, m_scope))) {
+			cash_account(cache_state, this_cpu, prev_cpu, warm_cpu,
+				     multi_cluster);
+			cash_update_warmness(p, this_cpu);
 			return this_cpu;
+		}
 
 		if (!wake_wide(p)) {
-			cpumask_or(&m_group, cpu_smt_mask(prev_cpu), cpu_smt_mask(this_cpu));
-			tempo = aggro = 1;
+			cpumask_or(m_group, cpu_smt_mask(prev_cpu),
+				   cpu_smt_mask(this_cpu));
+			aggro = 1;
+			tempo = 1;
 		} else if (delta <= (u64)sched_cash_aggro_ns) {
-			cpumask_copy(&m_group, cpu_smt_mask(prev_cpu));
-			tempo = aggro = 1;
+			cpumask_copy(m_group, cpu_smt_mask(prev_cpu));
+			aggro = 1;
+			tempo = 1;
 		} else if (delta <= (u64)sched_cash_tempo_ns) {
 			tempo = 1;
 		}
 
-		if (aggro && unlikely(!cpumask_intersects(&m_group, &m_scope)))
+		if (aggro && unlikely(!cpumask_intersects(m_group, m_scope)))
 			aggro = 0;
+	}
+
+	/* ALWAYS prefer idle prev_cpu first to reduce cross-core thrashing */
+	if (prev_cpu >= 0 && available_idle_cpu(prev_cpu) &&
+	    cpumask_test_cpu(prev_cpu, m_scope)) {
+		cash_account(cache_state, prev_cpu, prev_cpu, warm_cpu,
+			     multi_cluster);
+		cash_update_warmness(p, prev_cpu);
+		return prev_cpu;
+	}
+
+	/* Fast-path: Only migrate immediately if task is HOT (2) or warm_cpu == prev_cpu */
+	if (cache_state > 0 && warm_cpu >= 0 &&
+	    cpumask_test_cpu(warm_cpu, m_scope) &&
+	    available_idle_cpu(warm_cpu)) {
+		if (cache_state == 2 || warm_cpu == prev_cpu) {
+			cash_account(cache_state, warm_cpu, prev_cpu, warm_cpu,
+				     multi_cluster);
+			cash_update_warmness(p, warm_cpu);
+			cash_inc_migrations(p);
+			return warm_cpu;
+		}
 	}
 
 	p_est = _task_util_est(p);
@@ -321,15 +417,18 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu, int wak
 
 retry:
 	if (!aggro) {
-		if (READ_ONCE(cash_sg))
-			cpumask_copy(&m_group, cash_find_group(prev_cpu, wake_flags, &m_scope));
+		if (READ_ONCE(cash_sg) && !tempo)
+			cpumask_copy(m_group,
+				     cash_find_group(prev_cpu, wake_flags,
+						     m_scope));
 		else
-			cpumask_copy(&m_group, cpu_present_mask);
+			cpumask_copy(m_group, m_scope);
 	}
 
 rescan:
 	best.factor = -SCHED_CAPACITY_SCALE;
-	for_each_cpu_and(cpu, &m_scope, &m_group) {
+	best.cpu = -1;
+	for_each_cpu_and(cpu, m_scope, m_group) {
 		struct rq *rq = cpu_rq(cpu);
 		long factor;
 
@@ -344,11 +443,36 @@ rescan:
 		if (p_que && cpu == p_cpu)
 			factor += p_est;
 
+		/* Locality stickiness to prevent trivial migrations */
+		if (cpu == prev_cpu)
+			factor += 64;
+
+#ifdef CONFIG_IRQ_TIME_ACCOUNTING
+		if (cpu_util_irq(rq) > 200 && !(wake_flags & WF_SYNC))
+			factor -= (SCHED_CAPACITY_SCALE / 4);
+#endif
+
 		if (cache_state > 0 && warm_cpu >= 0) {
-			if (cpumask_test_cpu(cpu, cpu_smt_mask(warm_cpu)))
-				factor += sched_cash_smt_bonus * cache_state;
-			if (cash_has_clusters && cash_same_cluster(cpu, warm_cpu))
-				factor += sched_cash_cluster_bonus * cache_state;
+			unsigned long util = READ_ONCE(rq->cfs.avg.util_est) +
+					     READ_ONCE(rq->avg_rt.util_avg);
+
+			if (util < (SCHED_CAPACITY_SCALE * 7 / 8) ||
+			    available_idle_cpu(cpu)) {
+				long smt_headroom = SCHED_CAPACITY_SCALE - util;
+				long dynamic_smt_bonus =
+					(sched_cash_smt_bonus * smt_headroom) /
+					SCHED_CAPACITY_SCALE;
+
+				if (cpumask_test_cpu(cpu,
+						     cpu_smt_mask(warm_cpu)))
+					factor +=
+						dynamic_smt_bonus * cache_state;
+
+				if (multi_cluster &&
+				    cash_same_cluster(cpu, warm_cpu))
+					factor += sched_cash_cluster_bonus *
+						  cache_state;
+			}
 		}
 
 		if (factor > best.factor) {
@@ -365,39 +489,67 @@ rescan:
 
 		if (unlikely(best.cpu < 0 || best.cpu >= nr_cpu_ids))
 			return select_task_rq_fair(p, prev_cpu, wake_flags);
+
+		{
+			struct rq *rq = cpu_rq(best.cpu);
+
+			if (static_branch_unlikely(&sched_asym_cpucapacity))
+				best.factor = arch_scale_cpu_capacity(best.cpu);
+			else
+				best.factor = SCHED_CAPACITY_SCALE;
+
+			best.factor -= (long)(READ_ONCE(rq->cfs.avg.util_est) +
+					      READ_ONCE(rq->avg_rt.util_avg));
+
+			if (p_que && best.cpu == p_cpu)
+				best.factor += p_est;
+
+			if (cache_state > 0 && warm_cpu >= 0) {
+				if (cpumask_test_cpu(best.cpu,
+						     cpu_smt_mask(warm_cpu)))
+					best.factor += sched_cash_smt_bonus *
+						       cache_state;
+				if (multi_cluster &&
+				    cash_same_cluster(best.cpu, warm_cpu)) {
+					best.factor +=
+						sched_cash_cluster_bonus *
+						cache_state;
+				}
+			}
+		}
 	}
 
 	if (aggro && (best.factor - p_est < 64L)) {
 		aggro = 0;
+		tempo = 1;
 		goto retry;
 	}
 
-	cash_account(cache_state, best.cpu, prev_cpu, warm_cpu, cash_has_clusters);
+	cash_account(cache_state, best.cpu, prev_cpu, warm_cpu, multi_cluster);
 
 	cash_update_warmness(p, best.cpu);
-	p->cash_migrations++;
+	cash_inc_migrations(p);
 
 	if (!READ_ONCE(cash_sg))
 		return best.cpu;
 
 	if (!aggro) {
-		if (likely(cpumask_subset(&m_group, &m_scope))) {
-			struct sched_group *sg = per_cpu(cash_sg_ptr, best.cpu);
-			long ewma = (READ_ONCE(sg->factor) * 3 + best.factor) >> 2;
-			WRITE_ONCE(sg->factor, ewma);
-		}
-
 		if (!tempo && (wake_flags & WF_TTWU)) {
-			struct cpumask *new = cash_best_group(best.cpu, &m_scope);
+			struct cpumask *new =
+				cash_best_group(best.cpu, m_scope);
 
-			if (!cpumask_intersects(&m_group, new)) {
-				cpumask_copy(&m_group, new);
+			if (!new)
+				goto done;
+
+			if (!cpumask_intersects(m_group, new)) {
+				cpumask_copy(m_group, new);
 				tempo = 1;
 				goto rescan;
 			}
 		}
 	}
 
+done:
 	return best.cpu;
 }
 
@@ -485,7 +637,6 @@ late_initcall(sched_cash_sysctl_init);
 static int cash_proc_show(struct seq_file *m, void *v)
 {
 	struct cash_stats snap;
-
 	unsigned long wfsync[CASH_WFSYNC_PATH_MAX];
 
 	cash_stats_sum(&snap);

@@ -1,10 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
- *  Cache-Aware Scheduling Heuristic (CASH)
+ *  Cache-Aware Scheduling Heuristic (CASH) CPU Scheduler
  *  Copyright (C) 2025 shygosh <shygosh@proton.me>
- *  Copyright (C) 2025 UsiFX <xprjkts@gmail.com>
+ *  Copyright (C) 2025-2026 Youssef Mahmoud <xprjkts@gmail.com>
  */
+#include <linux/suspend.h>
+#include <linux/workqueue.h>
 #include <linux/cpuhotplug.h>
+#include <linux/sched/rt.h>
+#include <linux/kernel_stat.h>
 #include <linux/topology.h>
 #include <linux/sched/topology.h>
 
@@ -21,7 +24,13 @@ static unsigned int sched_cash_tempo_ns __read_mostly = 12000000;
 static unsigned int sched_cash_warm_ns __read_mostly = 20000000;
 static unsigned int sched_cash_smt_bonus __read_mostly = 128;
 static unsigned int sched_cash_cluster_bonus __read_mostly = 64;
+static unsigned int sched_cash_enabled __read_mostly = 1;
 
+/* Autotuner controls */
+static unsigned int sched_cash_autotune __read_mostly = 1;
+static struct delayed_work cash_autotune_work;
+static u64 prev_total_placements;
+static u64 prev_migrations;
 
 static DEFINE_PER_CPU(struct sched_group *, cash_sg_ptr);
 static DEFINE_PER_CPU(struct sched_domain *, cash_cluster_sd);
@@ -43,7 +52,7 @@ struct cash_stats {
 
 static DEFINE_PER_CPU(struct cash_stats, cash_stats);
 
-/* Sum per-CPU stats into *out. Only used from slow paths (proc reads). */
+/* Sum per-CPU stats into *out. Only used from slow paths (proc reads, autotune tick). */
 static void cash_stats_sum(struct cash_stats *out)
 {
 	int cpu;
@@ -555,34 +564,121 @@ done:
 
 static bool cash_hp_registered __read_mostly;
 
-void sched_cash_init(void)
+static void cash_autotune_fn(struct work_struct *work)
 {
-	int cpu;
-	int ret;
+	struct cash_stats snap;
+	u64 total, migs;
+	u64 delta_tot, delta_mig, mig_pct;
+	unsigned int nr_cpus = num_online_cpus();
 
-	if (cash_hp_registered)
-		return;
+	u64 heavy_load_thresh = 300 * nr_cpus;
+	u64 min_sample_thresh = 60 * nr_cpus;
 
-	for_each_possible_cpu(cpu) {
-		if (!zalloc_cpumask_var_node(&per_cpu(cash_scope_mask, cpu),
-					     GFP_KERNEL, cpu_to_node(cpu)) ||
-		    !zalloc_cpumask_var_node(&per_cpu(cash_group_mask, cpu),
-					     GFP_KERNEL, cpu_to_node(cpu))) {
-			pr_err("sched_cash: failed to allocate scratch cpumasks\n");
-			return;
+	unsigned int target_smt = 64;
+	unsigned int target_aggro = 8000000;
+	unsigned int cur_smt, new_smt, cur_aggro, new_aggro;
+
+	if (unlikely(!READ_ONCE(sched_cash_enabled) ||
+		     !READ_ONCE(sched_cash_autotune)))
+		goto reschedule;
+
+	cash_stats_sum(&snap);
+	total = snap.total_placements;
+	migs = snap.migrations;
+
+	delta_tot = total - prev_total_placements;
+	delta_mig = migs - prev_migrations;
+
+	prev_total_placements = total;
+	prev_migrations = migs;
+
+	if (delta_tot >= min_sample_thresh) {
+		mig_pct = (delta_mig * 100) / (delta_tot + 1);
+
+		if (delta_tot > heavy_load_thresh) {
+			if (mig_pct > 30) {
+				target_smt = 128;
+				target_aggro = 3000000;
+			} else {
+				target_smt = 64;
+				target_aggro = 5000000;
+			}
+		} else {
+			target_smt = 96;
+			target_aggro = 8000000;
 		}
 	}
 
-	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "sched/cash:online", cash_cpu_online, cash_cpu_offline);
-	if (ret < 0)
-	{
-		pr_err("sched_cash: failed to register CPU hotplug state\n");
+	/* EWMA Filtering: 7/8 previous + 1/8 target */
+	cur_smt = READ_ONCE(sched_cash_smt_bonus);
+	new_smt = (cur_smt * 7 + target_smt) / 8;
+	WRITE_ONCE(sched_cash_smt_bonus, new_smt);
+
+	cur_aggro = READ_ONCE(sched_cash_aggro_ns);
+	new_aggro = (cur_aggro * 7 + target_aggro) / 8;
+	WRITE_ONCE(sched_cash_aggro_ns, new_aggro);
+
+reschedule:
+	schedule_delayed_work(&cash_autotune_work, msecs_to_jiffies(100));
+}
+
+void sched_cash_init(void)
+{
+	int cpu;
+
+	if (!cash_hp_registered) {
+		int ret;
+
+		/*
+		 * Allocate the per-cpu scratch cpumasks used by
+		 * cash_select_task_rq_fair() up front, before cash_up is
+		 * published, so no wakeup path can ever observe them unset.
+		 */
+		for_each_possible_cpu(cpu) {
+			if (!zalloc_cpumask_var_node(
+				    &per_cpu(cash_scope_mask, cpu), GFP_KERNEL,
+				    cpu_to_node(cpu)) ||
+			    !zalloc_cpumask_var_node(
+				    &per_cpu(cash_group_mask, cpu), GFP_KERNEL,
+				    cpu_to_node(cpu))) {
+				pr_err("sched_cash: failed to allocate scratch cpumasks\n");
+				goto free_masks;
+			}
+		}
+
+		ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "sched/cash:online", cash_cpu_online, cash_cpu_offline);
+		if (ret < 0)
+		{
+			pr_err("sched_cash: failed to register CPU hotplug state\n");
+			return;
+		}
+		cash_hp_registered = true;
+		smp_store_release(&cash_up, true);
+
+		INIT_DELAYED_WORK(&cash_autotune_work, cash_autotune_fn);
+		schedule_delayed_work(&cash_autotune_work, msecs_to_jiffies(250));
+
+		pr_info_ratelimited("sched_cash: initialized via cpuhp (cash_up=%d)\n", READ_ONCE(cash_up));
+		return;
+
+free_masks:
+		for_each_possible_cpu(cpu)
+		{
+			free_cpumask_var(per_cpu(cash_scope_mask, cpu));
+			free_cpumask_var(per_cpu(cash_group_mask, cpu));
+		}
 		return;
 	}
-	cash_hp_registered = true;
-	WRITE_ONCE(cash_up, true);
-	pr_info("sched_cash: initialized via cpuhp\n");
+
+	for_each_online_cpu(cpu)
+	cash_cpu_online(cpu);
 }
+static int __init sched_cash_initcall(void)
+{
+	sched_cash_init();
+	return 0;
+}
+late_initcall(sched_cash_initcall);
 
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table sched_cash_sysctls[] = {

@@ -15483,7 +15483,6 @@ DEFINE_SCHED_CLASS(fair) = {
 	.put_prev_task		= put_prev_task_fair,
 	.set_next_task          = set_next_task_fair,
 
-	.balance		= balance_fair,
 #ifdef CONFIG_SCHED_CASH
 	.select_task_rq		= cash_select_task_rq_fair,
 #else

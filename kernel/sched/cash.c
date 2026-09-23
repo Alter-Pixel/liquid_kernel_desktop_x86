@@ -683,41 +683,59 @@ late_initcall(sched_cash_initcall);
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table sched_cash_sysctls[] = {
 	{
-		.procname	= "sched_cash_tempo_ns",
-		.data		= &sched_cash_tempo_ns,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_douintvec_minmax,
-		.extra1		= (void *)&sched_cash_aggro_ns,
+		.procname = "sched_cash_enabled",
+		.data = &sched_cash_enabled,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1 = SYSCTL_ZERO,
+		.extra2 = SYSCTL_ONE,
 	},
 	{
-		.procname	= "sched_cash_aggro_ns",
-		.data		= &sched_cash_aggro_ns,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_douintvec_minmax,
-		.extra2		= (void *)&sched_cash_tempo_ns,
+		.procname = "sched_cash_tempo_ns",
+		.data = &sched_cash_tempo_ns,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1 = (void *)&sched_cash_aggro_ns,
 	},
 	{
-		.procname	= "sched_cash_warm_ns",
-		.data		= &sched_cash_warm_ns,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_douintvec,
+		.procname = "sched_cash_aggro_ns",
+		.data = &sched_cash_aggro_ns,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra2 = (void *)&sched_cash_tempo_ns,
 	},
 	{
-		.procname	= "sched_cash_smt_bonus",
-		.data		= &sched_cash_smt_bonus,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_douintvec,
+		.procname = "sched_cash_warm_ns",
+		.data = &sched_cash_warm_ns,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec,
 	},
 	{
-		.procname	= "sched_cash_cluster_bonus",
-		.data		= &sched_cash_cluster_bonus,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_douintvec,
+		.procname = "sched_cash_smt_bonus",
+		.data = &sched_cash_smt_bonus,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec,
+	},
+	{
+		.procname = "sched_cash_cluster_bonus",
+		.data = &sched_cash_cluster_bonus,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec,
+	},
+	{
+		.procname = "sched_cash_autotune",
+		.data = &sched_cash_autotune,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1 = SYSCTL_ZERO,
+		.extra2 = SYSCTL_ONE,
 	},
 };
 
@@ -750,7 +768,7 @@ static int cash_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "warm_ns %u\n", sched_cash_warm_ns);
 	seq_printf(m, "smt_bonus %u\n", sched_cash_smt_bonus);
 	seq_printf(m, "cluster_bonus %u\n", sched_cash_cluster_bonus);
-	seq_printf(m, "enabled %d\n", READ_ONCE(cash_up));
+	seq_printf(m, "enabled %d\n", READ_ONCE(sched_cash_enabled));
 	seq_printf(m, "groups %d\n", READ_ONCE(cash_sg));
 	seq_printf(m, "clusters %d\n", READ_ONCE(cash_has_clusters));
 	seq_printf(m, "wfsync_prev_idle %lu\n", wfsync[CASH_WFSYNC_PREV_IDLE]);
@@ -768,20 +786,37 @@ static int cash_proc_open(struct inode *inode, struct file *file)
 static ssize_t cash_proc_write(struct file *file, const char __user *buf,
 			       size_t count, loff_t *ppos)
 {
-	int cpu;
+	char kbuf[4];
 
-	for_each_possible_cpu(cpu)
-		memset(per_cpu_ptr(&cash_stats, cpu), 0, sizeof(struct cash_stats));
+	if (count == 0 || count >= sizeof(kbuf))
+		return -EINVAL;
+
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+
+	kbuf[count] = '\0';
+
+	if (kbuf[0] == '1' || kbuf[0] == '0') {
+		int cpu;
+
+		for_each_possible_cpu(cpu) {
+			memset(per_cpu_ptr(&cash_stats, cpu), 0,
+			       sizeof(struct cash_stats));
+			memset(per_cpu(cash_wfsync_hits, cpu), 0,
+			       sizeof(unsigned long) * CASH_WFSYNC_PATH_MAX);
+		}
+		pr_info_ratelimited("sched_cash: stats reset triggered\n");
+	}
 
 	return count;
 }
 
 static const struct proc_ops cash_proc_ops = {
-	.proc_open	= cash_proc_open,
-	.proc_read	= seq_read,
-	.proc_write	= cash_proc_write,
-	.proc_lseek	= seq_lseek,
-	.proc_release	= single_release,
+	.proc_open = cash_proc_open,
+	.proc_read = seq_read,
+	.proc_write = cash_proc_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
 };
 
 static int __init sched_cash_proc_init(void)

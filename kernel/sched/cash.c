@@ -19,16 +19,63 @@ bool cash_sg __read_mostly;
 static bool cash_has_clusters __read_mostly;
 
 struct cash_stats {
-	atomic64_t	total_placements;
-	atomic64_t	smt_hits;
-	atomic64_t	cluster_hits;
-	atomic64_t	cache_hot;
-	atomic64_t	cache_warm;
-	atomic64_t	cache_cold;
-	atomic64_t	migrations;
+	u64	total_placements;
+	u64	smt_hits;
+	u64	cluster_hits;
+	u64	cache_hot;
+	u64	cache_warm;
+	u64	cache_cold;
+	u64	migrations;
 };
 
-static struct cash_stats __cacheline_aligned_in_smp cash_stats;
+static DEFINE_PER_CPU(struct cash_stats, cash_stats);
+
+/* Sum per-CPU stats into *out. Only used from slow paths (proc reads). */
+static void cash_stats_sum(struct cash_stats *out)
+{
+	int cpu;
+
+	memset(out, 0, sizeof(*out));
+	for_each_possible_cpu(cpu)
+	{
+		struct cash_stats *s = per_cpu_ptr(&cash_stats, cpu);
+
+		out->total_placements += s->total_placements;
+		out->smt_hits += s->smt_hits;
+		out->cluster_hits += s->cluster_hits;
+		out->cache_hot += s->cache_hot;
+		out->cache_warm += s->cache_warm;
+		out->cache_cold += s->cache_cold;
+		out->migrations += s->migrations;
+	}
+}
+
+/* Single point of truth for cash_stats accounting. */
+static inline void cash_account(int cache_state, int chosen_cpu, int prev_cpu,
+			       int warm_cpu, bool multi_cluster)
+{
+	struct cash_stats *s = this_cpu_ptr(&cash_stats);
+
+	s->total_placements++;
+
+	if (cache_state == 2)
+		s->cache_hot++;
+	else if (cache_state == 1)
+		s->cache_warm++;
+	else
+		s->cache_cold++;
+
+	if (warm_cpu >= 0)
+	{
+		if (cpumask_test_cpu(chosen_cpu, cpu_smt_mask(warm_cpu)))
+			s->smt_hits++;
+		if (multi_cluster && cash_same_cluster(chosen_cpu, warm_cpu))
+			s->cluster_hits++;
+	}
+
+	if (chosen_cpu != prev_cpu)
+		s->migrations++;
+}
 
 struct cash_cpu {
 	long factor;
@@ -208,23 +255,7 @@ rescan:
 		goto retry;
 	}
 
-	atomic64_inc(&cash_stats.total_placements);
-
-	if (cache_state == 2)
-		atomic64_inc(&cash_stats.cache_hot);
-	else if (cache_state == 1)
-		atomic64_inc(&cash_stats.cache_warm);
-	else
-		atomic64_inc(&cash_stats.cache_cold);
-
-	if (warm_cpu >= 0) {
-		if (cpumask_test_cpu(best.cpu, cpu_smt_mask(warm_cpu)))
-			atomic64_inc(&cash_stats.smt_hits);
-		if (cash_has_clusters && cash_same_cluster(best.cpu, warm_cpu))
-			atomic64_inc(&cash_stats.cluster_hits);
-		else if (cash_has_clusters && warm_cpu != best.cpu)
-			atomic64_inc(&cash_stats.migrations);
-	}
+	cash_account(cache_state, best.cpu, prev_cpu, warm_cpu, cash_has_clusters);
 
 	cash_update_warmness(p, best.cpu);
 	p->cash_migrations++;
@@ -358,13 +389,17 @@ late_initcall(sched_cash_sysctl_init);
 #ifdef CONFIG_PROC_FS
 static int cash_proc_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "total_placements %llu\n", atomic64_read(&cash_stats.total_placements));
-	seq_printf(m, "smt_hits %llu\n", atomic64_read(&cash_stats.smt_hits));
-	seq_printf(m, "cluster_hits %llu\n", atomic64_read(&cash_stats.cluster_hits));
-	seq_printf(m, "cache_hot %llu\n", atomic64_read(&cash_stats.cache_hot));
-	seq_printf(m, "cache_warm %llu\n", atomic64_read(&cash_stats.cache_warm));
-	seq_printf(m, "cache_cold %llu\n", atomic64_read(&cash_stats.cache_cold));
-	seq_printf(m, "migrations %llu\n", atomic64_read(&cash_stats.migrations));
+	struct cash_stats snap;
+
+	cash_stats_sum(&snap);
+
+	seq_printf(m, "total_placements %llu\n", snap.total_placements);
+	seq_printf(m, "smt_hits %llu\n", snap.smt_hits);
+	seq_printf(m, "cluster_hits %llu\n", snap.cluster_hits);
+	seq_printf(m, "cache_hot %llu\n", snap.cache_hot);
+	seq_printf(m, "cache_warm %llu\n", snap.cache_warm);
+	seq_printf(m, "cache_cold %llu\n", snap.cache_cold);
+	seq_printf(m, "migrations %llu\n", snap.migrations);
 	seq_printf(m, "aggro_ns %u\n", sched_cash_aggro_ns);
 	seq_printf(m, "tempo_ns %u\n", sched_cash_tempo_ns);
 	seq_printf(m, "warm_ns %u\n", sched_cash_warm_ns);
@@ -385,13 +420,10 @@ static int cash_proc_open(struct inode *inode, struct file *file)
 static ssize_t cash_proc_write(struct file *file, const char __user *buf,
 			       size_t count, loff_t *ppos)
 {
-	atomic64_set(&cash_stats.total_placements, 0);
-	atomic64_set(&cash_stats.smt_hits, 0);
-	atomic64_set(&cash_stats.cluster_hits, 0);
-	atomic64_set(&cash_stats.cache_hot, 0);
-	atomic64_set(&cash_stats.cache_warm, 0);
-	atomic64_set(&cash_stats.cache_cold, 0);
-	atomic64_set(&cash_stats.migrations, 0);
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		memset(per_cpu_ptr(&cash_stats, cpu), 0, sizeof(struct cash_stats));
 
 	return count;
 }

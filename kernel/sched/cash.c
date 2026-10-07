@@ -32,8 +32,8 @@ static u64 prev_migrations;
 static DEFINE_PER_CPU(struct sched_group *, cash_sg_ptr);
 static DEFINE_PER_CPU(cpumask_var_t, cash_scope_mask);
 static DEFINE_PER_CPU(cpumask_var_t, cash_group_mask);
-bool cash_up __read_mostly;
-bool cash_sg __read_mostly;
+bool cash_up __read_mostly __aligned(64);
+bool cash_sg __read_mostly __aligned(64);
 static bool cash_has_clusters __read_mostly;
 
 struct cash_stats {
@@ -576,8 +576,6 @@ done:
 	return best.cpu;
 }
 
-static bool cash_hp_registered __read_mostly;
-
 static void cash_autotune_fn(struct work_struct *work)
 {
 	struct cash_stats snap;
@@ -636,61 +634,74 @@ reschedule:
 	schedule_delayed_work(&cash_autotune_work, msecs_to_jiffies(100));
 }
 
-void sched_cash_init(void)
+/* Set once the scratch masks and the cpuhp state are live. */
+static bool cash_inited __read_mostly;
+
+/*
+ * Called from partition_sched_domains() under sched_domains_mutex, before
+ * the old topology is torn down. Wakeups fall back to stock CFS until
+ * sched_cash_refresh_domains() republishes cash_up.
+ */
+void sched_cash_domains_changing(void)
+{
+	smp_store_release(&cash_up, false);
+	WRITE_ONCE(cash_sg, false);
+}
+
+/*
+ * Refresh per-CPU sched-domain pointers. Safe to call with the hotplug
+ * lock held: it only walks online CPUs and reads the current domain tree.
+ * Called from partition_sched_domains() after every topology rebuild, and
+ * republishes cash_up once the one-time init has completed.
+ */
+void sched_cash_refresh_domains(void)
 {
 	int cpu;
 
-	if (!cash_hp_registered) {
-		int ret;
+	for_each_online_cpu(cpu)
+		cash_cpu_online(cpu);
 
-		/*
-		 * Allocate the per-cpu scratch cpumasks used by
-		 * cash_select_task_rq_fair() up front, before cash_up is
-		 * published, so no wakeup path can ever observe them unset.
-		 */
-		for_each_possible_cpu(cpu) {
-			if (!zalloc_cpumask_var_node(
-				    &per_cpu(cash_scope_mask, cpu), GFP_KERNEL,
-				    cpu_to_node(cpu)) ||
-			    !zalloc_cpumask_var_node(
-				    &per_cpu(cash_group_mask, cpu), GFP_KERNEL,
-				    cpu_to_node(cpu))) {
-				pr_err("sched_cash: failed to allocate scratch cpumasks\n");
-				goto free_masks;
-			}
-		}
-
-		ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "sched/cash:online", cash_cpu_online, cash_cpu_offline);
-		if (ret < 0) {
-			pr_err("sched_cash: failed to register CPU hotplug state\n");
-			return;
-		}
-		cash_hp_registered = true;
+	/* Never publish before the scratch cpumasks exist. */
+	if (READ_ONCE(cash_inited))
 		smp_store_release(&cash_up, true);
+}
 
-		INIT_DELAYED_WORK(&cash_autotune_work, cash_autotune_fn);
-		schedule_delayed_work(&cash_autotune_work, msecs_to_jiffies(250));
+void sched_cash_init(void)
+{
+	int cpu, ret;
 
-		pr_info_ratelimited("sched_cash: initialized via cpuhp (cash_up=%d)\n", READ_ONCE(cash_up));
-		return;
-
-free_masks:
-		for_each_possible_cpu(cpu) {
-			free_cpumask_var(per_cpu(cash_scope_mask, cpu));
-			free_cpumask_var(per_cpu(cash_group_mask, cpu));
+	for_each_possible_cpu(cpu) {
+		if (!zalloc_cpumask_var_node(&per_cpu(cash_scope_mask, cpu),
+			GFP_KERNEL, cpu_to_node(cpu)) ||
+			!zalloc_cpumask_var_node(&per_cpu(cash_group_mask, cpu),
+						 GFP_KERNEL, cpu_to_node(cpu))) {
+			pr_err("sched_cash: failed to allocate scratch cpumasks\n");
+			goto free_masks;
 		}
-		return;
 	}
 
-	for_each_online_cpu(cpu)
-	cash_cpu_online(cpu);
+	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "sched/cash:online",
+				cash_cpu_online, cash_cpu_offline);
+	if (ret < 0) {
+		pr_err("sched_cash: failed to register CPU hotplug state\n");
+		goto free_masks;
+	}
+
+	WRITE_ONCE(cash_inited, true);
+	sched_cash_refresh_domains();	/* republishes cash_up */
+
+	pr_info("sched_cash: initialized (cash_up=%d)\n", READ_ONCE(cash_up));
+
+	INIT_DELAYED_WORK(&cash_autotune_work, cash_autotune_fn);
+	schedule_delayed_work(&cash_autotune_work, msecs_to_jiffies(250));
+	return;
+
+free_masks:
+	for_each_possible_cpu(cpu) {
+		free_cpumask_var(per_cpu(cash_scope_mask, cpu));
+		free_cpumask_var(per_cpu(cash_group_mask, cpu));
+	}
 }
-static int __init sched_cash_initcall(void)
-{
-	sched_cash_init();
-	return 0;
-}
-late_initcall(sched_cash_initcall);
 
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table sched_cash_sysctls[] = {

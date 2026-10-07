@@ -10,13 +10,10 @@
 #include <linux/kernel_stat.h>
 #include <linux/topology.h>
 #include <linux/sched/topology.h>
+#include <linux/version.h>
 
-#ifndef SD_SHARE_LLC
-#ifdef SD_SHARE_PKG_RESOURCES
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,9,0)
 #define SD_SHARE_LLC SD_SHARE_PKG_RESOURCES
-#else
-#define SD_SHARE_LLC 0
-#endif
 #endif
 
 static unsigned int sched_cash_aggro_ns __read_mostly = 5000000;

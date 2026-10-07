@@ -4224,6 +4224,7 @@ DEFINE_CLASS_IS_UNCONDITIONAL(sched_change)
 extern bool cash_up __read_mostly;
 extern bool cash_sg __read_mostly;
 void sched_cash_init(void);
+void sched_cash_refresh_domains(void);
 #endif
 
 #endif /* _KERNEL_SCHED_SCHED_H */

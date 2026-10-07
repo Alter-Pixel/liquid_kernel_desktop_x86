@@ -213,40 +213,55 @@ static struct cpumask *cash_find_group(int cpu, int wake_flags, struct cpumask *
 
 static int cash_cpu_online(unsigned int cpu)
 {
-	struct sched_domain *sd;
+	struct sched_domain *sd, *sd_found = NULL;
 	struct sched_group *sg;
 	bool found_cluster = false;
 	unsigned int smt_weight = cpumask_weight(cpu_smt_mask(cpu));
+	unsigned int domain_weight = 0;
 
 	rcu_read_lock();
 	for_each_domain(cpu, sd)
 	{
-		/* Match x86 LLC/MC domains as well as ARM SD_CLUSTER */
-		if (sd->flags & (SD_CLUSTER | SD_SHARE_LLC))
-		{
-			per_cpu(cash_cluster_sd, cpu) = sd;
-			found_cluster = true;
 
-			if (sd->groups) {
-				sg = sd->groups;
-				per_cpu(cash_sg_ptr, cpu) = sg;
-				sg->factor = arch_scale_cpu_capacity(cpu);
+		/*
+		 * Match x86 LLC/MC domains as well as ARM SD_CLUSTER.
+		 * Keep advancing outwards while the flag holds SMT-level
+		 * domains carry it too (siblings tribially share cache),
+		 * so stopping at the first match grabs the SMT group
+		 * (span=1) instead of the real LLC-wide group.
+		 */
 
-				if (!READ_ONCE(cash_sg) && per_cpu(cash_sg_ptr, cpu)) {
-					/* Enable sched_group fast-path if group span exceeds SMT thread count */
-					if (cpumask_weight(sched_group_span(per_cpu(cash_sg_ptr, cpu))) > smt_weight)
-						WRITE_ONCE(cash_sg, true);
-				}
-			}
+		if (!(sd->flags & (SD_CLUSTER | SD_SHARE_LLC)))
 			break;
+
+		sd_found = sd;
+
+	}
+
+	if (sd_found)
+	{
+		per_cpu(cash_cluster_sd, cpu) = sd_found;
+		found_cluster = true;
+		domain_weight = cpumask_weight(sched_domain_span(sd_found));
+
+		if (sd_found->groups) {
+			sg = sd_found->groups;
+			per_cpu(cash_sg_ptr, cpu) = sg;
+			sg->factor = arch_scale_cpu_capacity(cpu);
+
+			if (!READ_ONCE(cash_sg) && domain_weight > smt_weight) {
+				WRITE_ONCE(cash_sg, true);
+			}
 		}
 	}
+
 	rcu_read_unlock();
 
 	if (found_cluster || cpumask_weight(topology_cluster_cpumask(cpu)) > 1)
 		WRITE_ONCE(cash_has_clusters, true);
 
-	pr_info("sched_cash: CPU %d online | cluster=%d | sg_weight=%u\n", cpu, READ_ONCE(cash_has_clusters), per_cpu(cash_sg_ptr, cpu) ? cpumask_weight(sched_group_span(per_cpu(cash_sg_ptr, cpu))) : 0);
+	pr_info("sched_cash: CPU %d online | cluster=%d | sg_weight=%u\n",
+		cpu, READ_ONCE(cash_has_clusters), domain_weight);
 
 	return 0;
 }

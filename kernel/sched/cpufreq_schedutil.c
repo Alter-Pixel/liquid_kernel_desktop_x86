@@ -959,3 +959,58 @@ bool sugov_is_governor(struct cpufreq_policy *policy)
 }
 
 cpufreq_governor_init(schedutil_gov);
+
+/*************** Exported helpers for external cpufreq governors ***************/
+
+/**
+ * cpufreq_get_capacity_ref_freq - Get the reference frequency for capacity
+ * scaling of a given cpufreq policy.
+ * @policy: the cpufreq policy of the CPU in question.
+ *
+ * Return: the reference CPU frequency.
+ */
+unsigned long cpufreq_get_capacity_ref_freq(struct cpufreq_policy *policy)
+{
+	return get_capacity_ref_freq(policy);
+}
+EXPORT_SYMBOL_GPL(cpufreq_get_capacity_ref_freq);
+
+/**
+ * cpufreq_get_effective_util - Get effective CPU utilization for frequency
+ * scaling, combining all scheduling classes and applying DVFS headroom.
+ * @cpu: the CPU number.
+ * @boost: additional utilization boost (e.g. from IO wait).
+ * @out_util: pointer to store the effective utilization (with DVFS headroom).
+ * @out_bw_min: pointer to store the minimum bandwidth requirement.
+ * @out_bw_max: pointer to store the maximum (allowed) performance level,
+ *		as required by cpufreq_driver_adjust_perf().
+ */
+void cpufreq_get_effective_util(int cpu, unsigned long boost,
+				unsigned long *out_util,
+				unsigned long *out_bw_min,
+				unsigned long *out_bw_max)
+{
+	unsigned long min, max, util = scx_cpuperf_target(cpu);
+
+	if (!scx_switched_all())
+		util += cpu_util_cfs_boost(cpu);
+	util = effective_cpu_util(cpu, util, &min, &max);
+	util = max(util, boost);
+	*out_bw_min = min;
+	*out_bw_max = max;
+	*out_util = sugov_effective_cpu_perf(cpu, util, min, max);
+}
+EXPORT_SYMBOL_GPL(cpufreq_get_effective_util);
+
+/**
+ * cpufreq_cpu_dl_bw_exceeded - Check if DL bandwidth exceeds minimum.
+ * @cpu: the CPU number.
+ * @bw_min: the minimum bandwidth to compare against.
+ *
+ * Return: true if the deadline bandwidth of @cpu exceeds @bw_min.
+ */
+bool cpufreq_cpu_dl_bw_exceeded(int cpu, unsigned long bw_min)
+{
+	return cpu_bw_dl(cpu_rq(cpu)) > bw_min;
+}
+EXPORT_SYMBOL_GPL(cpufreq_cpu_dl_bw_exceeded);

@@ -200,6 +200,33 @@ config CPU_FREQ_GOV_SCHEDUTIL
 
 	  If in doubt, say N.
 
+config CPU_FREQ_GOV_REFLEX
+	tristate "'reflex' cpufreq policy governor"
+	default m
+	depends on CPU_FREQ && SMP && CPU_FREQ_GOV_SCHEDUTIL
+	select CPU_FREQ_GOV_ATTR_SET
+	select IRQ_WORK
+	help
+	  This governor is schedutil plus a measured fast path for rising
+	  load.  Each CPU measures, from its idle time and frequency scale,
+	  the demand it actually ran; an interval without any idle means the
+	  CPU is falling behind, and the governor then runs it at the speed
+	  that best trades latency against energy instead of waiting for
+	  PELT to ramp up.  Otherwise it keeps up with demand like schedutil,
+	  never below the most efficient speed when that is known.  Work on
+	  a CPU that has not been seen running lately is presumed behind, the
+	  more so the less it has run.
+
+	  The speeds come from the Energy Model when one is registered,
+	  else from ACPI CPPC and a cube-law power model.  The latency_weight
+	  tunable sets the trade-off; the default 1000 runs work that is
+	  behind at the maximum frequency.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called cpufreq_reflex.
+
+	  If in doubt, say M.
+
 comment "CPU frequency scaling drivers"
 
 config CPUFREQ_DT

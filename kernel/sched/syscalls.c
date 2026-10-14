@@ -182,6 +182,7 @@ int idle_cpu(int cpu)
 {
 	return idle_rq(cpu_rq(cpu));
 }
+EXPORT_SYMBOL_GPL(idle_cpu);
 
 /**
  * idle_task - return the idle task for a given CPU.

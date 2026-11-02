@@ -245,7 +245,13 @@ static int cash_cpu_online(unsigned int cpu)
 			WRITE_ONCE(per_cpu(cash_sg_ptr, cpu), sg);
 			WRITE_ONCE(sg->factor, arch_scale_cpu_capacity(cpu));
 
-			if (!READ_ONCE(cash_sg) && domain_weight > smt_weight) {
+			/*
+			* cash_find_group() narrows the CPU scan to one sched_group's
+			* span. Only a win when the group spans more CPUs than a single
+			* SMT pair. On single-CCX machines where a sched_group *is* an
+			* SMT pair, narrowing scans 2 CPUs where 16 are available.
+			*/
+			if (!READ_ONCE(cash_sg) && cpumask_weight(sched_group_span(sg)) > smt_weight) {
 				WRITE_ONCE(cash_sg, true);
 			}
 		}

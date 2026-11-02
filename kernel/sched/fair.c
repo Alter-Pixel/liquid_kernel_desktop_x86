@@ -102,11 +102,7 @@ unsigned int sysctl_sched_base_slice			= 700000ULL;
 static unsigned int normalized_sysctl_sched_base_slice	= 700000ULL;
 #endif /* CONFIG_SCHED_BORE */
 
-#ifdef CONFIG_SCHED_CASH
-__read_mostly unsigned int sysctl_sched_migration_cost	= 1000000UL;
-#else
 __read_mostly unsigned int sysctl_sched_migration_cost	= 500000UL;
-#endif
 
 static int __init setup_sched_thermal_decay_shift(char *str)
 {
@@ -14278,10 +14274,6 @@ static int __active_load_balance_cpu_stop(void *data, unsigned int lb_flags)
 	/* Search for an sd spanning us and the target CPU. */
 	rcu_read_lock();
 	for_each_domain(target_cpu, sd) {
-#ifdef CONFIG_SCHED_CASH
-		if (sd->flags & SD_SHARE_CPUCAPACITY)
-			continue;
-#endif
 		if (cpumask_test_cpu(busiest_cpu, sched_domain_span(sd)))
 			break;
 	}
@@ -14434,10 +14426,6 @@ static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 		 */
 		need_decay = update_newidle_cost(sd, 0, 0);
 		max_cost += sd->max_newidle_lb_cost;
-#ifdef CONFIG_SCHED_CASH
-		if (sd->flags & SD_SHARE_CPUCAPACITY)
-			continue;
-#endif
 
 		/*
 		 * Stop the load balance at this level. There is another
@@ -15095,10 +15083,6 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 	for_each_domain(this_cpu, sd) {
 		u64 domain_cost;
 
-#ifdef CONFIG_SCHED_CASH
-		if (sd->flags & SD_SHARE_CPUCAPACITY)
-			continue;
-#endif
 		update_next_balance(sd, &next_balance);
 
 		if (this_rq->avg_idle < curr_cost + sd->max_newidle_lb_cost)

@@ -3146,7 +3146,7 @@ static inline void attach_one_task(struct rq *rq, struct task_struct *p)
 	attach_task(rq, p);
 }
 
-#if defined(CONFIG_PREEMPT_RT) || defined(CONFIG_SCHED_CASH)
+#if defined(CONFIG_PREEMPT_RT)
 # define SCHED_NR_MIGRATE_BREAK 8
 #else
 # define SCHED_NR_MIGRATE_BREAK 32
@@ -4269,6 +4269,7 @@ DEFINE_CLASS_IS_UNCONDITIONAL(sched_change)
 extern bool cash_up __read_mostly;
 extern bool cash_sg __read_mostly;
 void sched_cash_init(void);
+void sched_cash_domains_changing(void);
 void sched_cash_refresh_domains(void);
 #endif
 

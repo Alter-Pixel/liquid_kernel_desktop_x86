@@ -33,12 +33,19 @@ static unsigned int sched_cash_enabled __read_mostly = 1;
  *              candidate whose sibling is busy (so a fully idle core wins).
  *  scan_wrap:  start the candidate scan at prev_cpu instead of the lowest
  *              CPU, so score ties do not pile onto low-numbered CPUs.
+ *  sync_coloc: 1 (default) = on a WF_SYNC wakeup with prev_cpu busy, stack
+ *              the wakee on a contended waker CPU unconditionally.
+ *              0 = only stack when no idle CPU exists in the waker's LLC;
+ *              otherwise defer to CFS so the wakee runs in parallel.
+ *              2 = diagnostic: do the LLC idle scan and count it as
+ *              wfsync_idle_avoid, but stack anyway (measures scan cost).
  *  idle_first: in the scoring scan, an idle CPU always beats a busy one;
  *              capacity - util only ranks CPUs within the same class. If
  *              the narrow (aggro) group has no idle CPU, widen the scan.
  */
 static unsigned int sched_cash_core_aware __read_mostly = 1;
 static unsigned int sched_cash_scan_wrap __read_mostly = 1;
+static unsigned int sched_cash_sync_coloc __read_mostly = 1;
 static unsigned int sched_cash_idle_first __read_mostly = 1;
 static unsigned int sched_cash_smt_penalty __read_mostly = 256;
 static unsigned int cash_factor_max = SCHED_CAPACITY_SCALE;
@@ -109,6 +116,7 @@ enum cash_wfsync_path {
 	CASH_WFSYNC_PREV_IDLE = 0,
 	CASH_WFSYNC_THIS_BUSY,
 	CASH_WFSYNC_DEFER_CFS,
+	CASH_WFSYNC_IDLE_AVOID,
 	CASH_WFSYNC_PATH_MAX,
 };
 
@@ -358,6 +366,25 @@ static inline void cash_account(int cache_state, int chosen_cpu, int prev_cpu,
 		s->migrations++;
 }
 
+/*
+ * True if some CPU in @cpu's LLC (restricted to @scope) is idle. Caller
+ * holds rcu_read_lock().
+ */
+static bool cash_llc_has_idle(int cpu, const struct cpumask *scope)
+{
+	struct sched_domain *sd = rcu_dereference(per_cpu(sd_llc, cpu));
+	int i;
+
+	if (!sd)
+		return false;
+
+	for_each_cpu_and(i, sched_domain_span(sd), scope) {
+		if (i != cpu && available_idle_cpu(i))
+			return true;
+	}
+	return false;
+}
+
 static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu,
 				    int wake_flags)
 {
@@ -433,6 +460,16 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu,
 				 * real parallelism (sched pipe).
 				 */
 			if (cpu_rq(this_cpu)->nr_running > 1) {
+				unsigned int coloc = READ_ONCE(sched_cash_sync_coloc);
+
+				if (coloc != 1 &&
+				    cash_llc_has_idle(this_cpu, m_scope)) {
+					cash_wfsync_hit(CASH_WFSYNC_IDLE_AVOID);
+					if (coloc == 0)
+						return select_task_rq_fair(p,
+							prev_cpu, wake_flags);
+				}
+
 				cash_update_warmness(p, this_cpu);
 				cash_account(cache_state, this_cpu, prev_cpu,
 					     warm_cpu, multi_cluster);
@@ -892,6 +929,15 @@ static const struct ctl_table sched_cash_sysctls[] = {
 		.extra2 = SYSCTL_ONE,
 	},
 	{
+		.procname = "sched_cash_sync_coloc",
+		.data = &sched_cash_sync_coloc,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1 = SYSCTL_ZERO,
+		.extra2 = SYSCTL_TWO,
+	},
+	{
 		.procname = "sched_cash_idle_first",
 		.data = &sched_cash_idle_first,
 		.maxlen = sizeof(unsigned int),
@@ -955,12 +1001,14 @@ static int cash_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "wfsync_prev_idle %lu\n", wfsync[CASH_WFSYNC_PREV_IDLE]);
 	seq_printf(m, "wfsync_this_busy %lu\n", wfsync[CASH_WFSYNC_THIS_BUSY]);
 	seq_printf(m, "wfsync_defer_cfs %lu\n", wfsync[CASH_WFSYNC_DEFER_CFS]);
+	seq_printf(m, "wfsync_idle_avoid %lu\n", wfsync[CASH_WFSYNC_IDLE_AVOID]);
 	seq_printf(m, "slow_placements %llu\n", snap.slow_placements);
 	seq_printf(m, "busy_sibling_picks %llu\n", snap.busy_sibling_picks);
 	seq_printf(m, "idle_core_skipped %llu\n", snap.idle_core_skipped);
 	seq_printf(m, "busy_pick_idle_seen %llu\n", snap.busy_pick_idle_seen);
 	seq_printf(m, "core_aware %u\n", READ_ONCE(sched_cash_core_aware));
 	seq_printf(m, "scan_wrap %u\n", READ_ONCE(sched_cash_scan_wrap));
+	seq_printf(m, "sync_coloc %u\n", READ_ONCE(sched_cash_sync_coloc));
 	seq_printf(m, "idle_first %u\n", READ_ONCE(sched_cash_idle_first));
 	seq_printf(m, "smt_penalty %u\n", READ_ONCE(sched_cash_smt_penalty));
 

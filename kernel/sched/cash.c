@@ -23,6 +23,26 @@ static unsigned int sched_cash_smt_bonus __read_mostly = 128;
 static unsigned int sched_cash_cluster_bonus __read_mostly = 64;
 static unsigned int sched_cash_enabled __read_mostly = 1;
 
+/*
+ * Slow-path placement controls. core_aware, scan_wrap and idle_first are on
+ * by default: together they remove the request/wakeup p99 regression CASH
+ * had against stock placement (Ryzen 8C/16T, schbench) without giving up
+ * the hackbench gain. Set them to 0 to get the original CASH behaviour.
+ *  core_aware: grant the warm-SMT-sibling bonus only when the candidate's
+ *              SMT siblings are idle, and subtract smt_penalty from any
+ *              candidate whose sibling is busy (so a fully idle core wins).
+ *  scan_wrap:  start the candidate scan at prev_cpu instead of the lowest
+ *              CPU, so score ties do not pile onto low-numbered CPUs.
+ *  idle_first: in the scoring scan, an idle CPU always beats a busy one;
+ *              capacity - util only ranks CPUs within the same class. If
+ *              the narrow (aggro) group has no idle CPU, widen the scan.
+ */
+static unsigned int sched_cash_core_aware __read_mostly = 1;
+static unsigned int sched_cash_scan_wrap __read_mostly = 1;
+static unsigned int sched_cash_idle_first __read_mostly = 1;
+static unsigned int sched_cash_smt_penalty __read_mostly = 256;
+static unsigned int cash_factor_max = SCHED_CAPACITY_SCALE;
+
 /* Autotuner controls */
 static unsigned int sched_cash_autotune __read_mostly = 1;
 static struct delayed_work cash_autotune_work;
@@ -44,6 +64,11 @@ struct cash_stats {
 	u64 cache_warm;
 	u64 cache_cold;
 	u64 migrations;
+	/* Slow-path (scoring scan) diagnostics */
+	u64 slow_placements;
+	u64 busy_sibling_picks;	/* chosen CPU had a busy SMT sibling */
+	u64 idle_core_skipped;	/* ...while a fully idle core was scanned */
+	u64 busy_pick_idle_seen; /* chose a busy CPU while an idle one was scanned */
 };
 
 static DEFINE_PER_CPU(struct cash_stats, cash_stats);
@@ -65,6 +90,10 @@ static void cash_stats_sum(struct cash_stats *out)
 		out->cache_warm += s->cache_warm;
 		out->cache_cold += s->cache_cold;
 		out->migrations += s->migrations;
+		out->slow_placements += s->slow_placements;
+		out->busy_sibling_picks += s->busy_sibling_picks;
+		out->idle_core_skipped += s->idle_core_skipped;
+		out->busy_pick_idle_seen += s->busy_pick_idle_seen;
 	}
 }
 
@@ -146,6 +175,25 @@ static inline void cash_update_warmness(struct task_struct *p, int cpu)
 	WRITE_ONCE(p->cash_warm_until, now + sched_cash_warm_ns);
 }
 
+
+/*
+ * True if any SMT sibling of @cpu (other than @cpu itself and @ignore) is
+ * running something. @ignore lets the caller discount the CPU the waking
+ * task itself currently occupies. Lockless snapshot; good enough for a
+ * placement heuristic.
+ */
+static inline bool cash_sibling_busy(int cpu, int ignore)
+{
+	int sib;
+
+	for_each_cpu(sib, cpu_smt_mask(cpu)) {
+		if (sib == cpu || sib == ignore)
+			continue;
+		if (!idle_cpu(sib))
+			return true;
+	}
+	return false;
+}
 
 static inline bool cash_same_cluster(int cpu1, int cpu2)
 {
@@ -330,13 +378,15 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu,
 
 	struct cpumask *m_group = this_cpu_cpumask_var_ptr(cash_group_mask);
 	struct cpumask *m_scope = this_cpu_cpumask_var_ptr(cash_scope_mask);
-	struct cash_cpu best;
+	struct cash_cpu best, best_idle;
 	unsigned int p_est;
 	int cpu, p_cpu, p_que;
 	int aggro = 0, tempo = 0;
 	int cache_state = 0;
 	int warm_cpu, ref_cpu;
-	bool multi_cluster;
+	int scan_start, sib_ignore;
+	unsigned int smt_penalty;
+	bool multi_cluster, core_aware, saw_idle_core, saw_idle, idle_first;
 	u64 now;
 
 	if (unlikely(!cpumask_and(m_scope, cpu_active_mask, p->cpus_ptr)))
@@ -444,6 +494,13 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu,
 	p_cpu = task_cpu(p);
 	p_que = current == p || task_on_rq_queued(p);
 
+	core_aware = READ_ONCE(sched_cash_core_aware);
+	idle_first = READ_ONCE(sched_cash_idle_first);
+	smt_penalty = READ_ONCE(sched_cash_smt_penalty);
+	sib_ignore = p_que ? p_cpu : -1;
+	scan_start = (READ_ONCE(sched_cash_scan_wrap) && prev_cpu >= 0 &&
+		      prev_cpu < nr_cpu_ids) ? prev_cpu : 0;
+
 retry:
 	if (!aggro) {
 		if (READ_ONCE(cash_sg) && !tempo)
@@ -457,9 +514,23 @@ retry:
 rescan:
 	best.factor = -SCHED_CAPACITY_SCALE;
 	best.cpu = -1;
-	for_each_cpu_and(cpu, m_scope, m_group) {
+	best_idle.factor = LONG_MIN;
+	best_idle.cpu = -1;
+	saw_idle_core = false;
+	saw_idle = false;
+	/* m_group is per-CPU scratch; restrict it to scope so we can wrap. */
+	cpumask_and(m_group, m_group, m_scope);
+	for_each_cpu_wrap(cpu, m_group, scan_start) {
 		struct rq *rq = cpu_rq(cpu);
+		bool sib_busy = cash_sibling_busy(cpu, sib_ignore);
+		bool cpu_idle = available_idle_cpu(cpu);
 		long factor;
+
+		if (cpu_idle) {
+			saw_idle = true;
+			if (!sib_busy)
+				saw_idle_core = true;
+		}
 
 		if (static_branch_unlikely(&sched_asym_cpucapacity))
 			factor = arch_scale_cpu_capacity(cpu);
@@ -481,6 +552,10 @@ rescan:
 			factor -= (SCHED_CAPACITY_SCALE / 4);
 #endif
 
+		/* Sharing a core with a running sibling costs real throughput. */
+		if (core_aware && sib_busy)
+			factor -= smt_penalty;
+
 		if (cache_state > 0 && warm_cpu >= 0) {
 			unsigned long util = READ_ONCE(rq->cfs.avg.util_est) +
 					     READ_ONCE(rq->avg_rt.util_avg);
@@ -492,8 +567,14 @@ rescan:
 					(sched_cash_smt_bonus * smt_headroom) /
 					SCHED_CAPACITY_SCALE;
 
+				/*
+				 * The warm sibling only helps if we don't end up
+				 * time-sharing the core with whatever is running
+				 * on warm_cpu now.
+				 */
 				if (cpumask_test_cpu(cpu,
-						     cpu_smt_mask(warm_cpu)))
+						     cpu_smt_mask(warm_cpu)) &&
+				    (!core_aware || !sib_busy))
 					factor +=
 						dynamic_smt_bonus * cache_state;
 
@@ -507,6 +588,25 @@ rescan:
 		if (factor > best.factor) {
 			best.cpu = cpu;
 			best.factor = factor;
+		}
+		if (cpu_idle && factor > best_idle.factor) {
+			best_idle.cpu = cpu;
+			best_idle.factor = factor;
+		}
+	}
+
+	/*
+	 * idle_first: never queue behind running work when an idle CPU was
+	 * scanned. If the narrow aggro group had none, widen the scan once
+	 * (the aggro retry below drops to tempo, i.e. the full scope).
+	 */
+	if (idle_first) {
+		if (best_idle.cpu >= 0)
+			best = best_idle;
+		else if (aggro) {
+			aggro = 0;
+			tempo = 1;
+			goto retry;
 		}
 	}
 
@@ -579,6 +679,20 @@ done:
 	 * group rescan, so a rescan counted the same wakeup twice.
 	 */
 	cash_account(cache_state, best.cpu, prev_cpu, warm_cpu, multi_cluster);
+	{
+		struct cash_stats *s = this_cpu_ptr(&cash_stats);
+
+		s->slow_placements++;
+		if (saw_idle && !available_idle_cpu(best.cpu) &&
+		    !(p_que && best.cpu == p_cpu))
+			s->busy_pick_idle_seen++;
+		if (cash_sibling_busy(best.cpu, sib_ignore)) {
+			s->busy_sibling_picks++;
+			if (saw_idle_core)
+				s->idle_core_skipped++;
+		}
+	}
+
 	cash_update_warmness(p, best.cpu);
 	cash_inc_migrations(p);
 	return best.cpu;
@@ -760,6 +874,42 @@ static const struct ctl_table sched_cash_sysctls[] = {
 		.proc_handler = proc_douintvec,
 	},
 	{
+		.procname = "sched_cash_core_aware",
+		.data = &sched_cash_core_aware,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1 = SYSCTL_ZERO,
+		.extra2 = SYSCTL_ONE,
+	},
+	{
+		.procname = "sched_cash_scan_wrap",
+		.data = &sched_cash_scan_wrap,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1 = SYSCTL_ZERO,
+		.extra2 = SYSCTL_ONE,
+	},
+	{
+		.procname = "sched_cash_idle_first",
+		.data = &sched_cash_idle_first,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1 = SYSCTL_ZERO,
+		.extra2 = SYSCTL_ONE,
+	},
+	{
+		.procname = "sched_cash_smt_penalty",
+		.data = &sched_cash_smt_penalty,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1 = SYSCTL_ZERO,
+		.extra2 = &cash_factor_max,
+	},
+	{
 		.procname = "sched_cash_autotune",
 		.data = &sched_cash_autotune,
 		.maxlen = sizeof(unsigned int),
@@ -805,6 +955,14 @@ static int cash_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "wfsync_prev_idle %lu\n", wfsync[CASH_WFSYNC_PREV_IDLE]);
 	seq_printf(m, "wfsync_this_busy %lu\n", wfsync[CASH_WFSYNC_THIS_BUSY]);
 	seq_printf(m, "wfsync_defer_cfs %lu\n", wfsync[CASH_WFSYNC_DEFER_CFS]);
+	seq_printf(m, "slow_placements %llu\n", snap.slow_placements);
+	seq_printf(m, "busy_sibling_picks %llu\n", snap.busy_sibling_picks);
+	seq_printf(m, "idle_core_skipped %llu\n", snap.idle_core_skipped);
+	seq_printf(m, "busy_pick_idle_seen %llu\n", snap.busy_pick_idle_seen);
+	seq_printf(m, "core_aware %u\n", READ_ONCE(sched_cash_core_aware));
+	seq_printf(m, "scan_wrap %u\n", READ_ONCE(sched_cash_scan_wrap));
+	seq_printf(m, "idle_first %u\n", READ_ONCE(sched_cash_idle_first));
+	seq_printf(m, "smt_penalty %u\n", READ_ONCE(sched_cash_smt_penalty));
 
 	return 0;
 }

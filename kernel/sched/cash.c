@@ -554,13 +554,8 @@ rescan:
 		goto retry;
 	}
 
-	cash_account(cache_state, best.cpu, prev_cpu, warm_cpu, multi_cluster);
-
-	cash_update_warmness(p, best.cpu);
-	cash_inc_migrations(p);
-
 	if (!READ_ONCE(cash_sg))
-		return best.cpu;
+		goto done;
 
 	if (!aggro) {
 		if (!tempo && (wake_flags & WF_TTWU)) {
@@ -579,6 +574,13 @@ rescan:
 	}
 
 done:
+	/*
+	 * Account exactly once per placement. Previously this sat above the
+	 * group rescan, so a rescan counted the same wakeup twice.
+	 */
+	cash_account(cache_state, best.cpu, prev_cpu, warm_cpu, multi_cluster);
+	cash_update_warmness(p, best.cpu);
+	cash_inc_migrations(p);
 	return best.cpu;
 }
 

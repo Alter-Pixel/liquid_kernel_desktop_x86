@@ -57,6 +57,7 @@ static unsigned int sched_cash_autotune __read_mostly = 1;
 static struct delayed_work cash_autotune_work;
 static u64 prev_total_placements;
 static u64 prev_migrations;
+static bool cash_autotune_ready;	/* work initialised, safe to queue */
 
 static DEFINE_PER_CPU(struct sched_group *, cash_sg_ptr);
 static DEFINE_PER_CPU(cpumask_var_t, cash_scope_mask);
@@ -754,9 +755,13 @@ static void cash_autotune_fn(struct work_struct *work)
 	unsigned int target_aggro = 8000000;
 	unsigned int cur_smt, new_smt, cur_aggro, new_aggro;
 
+	/*
+	 * Nothing to tune: stop instead of waking a kworker every 100 ms
+	 * forever. cash_autotune_kick() restarts us from the sysctl handlers.
+	 */
 	if (unlikely(!READ_ONCE(sched_cash_enabled) ||
 		     !READ_ONCE(sched_cash_autotune)))
-		goto reschedule;
+		return;
 
 	cash_stats_sum(&snap);
 	total = snap.total_placements;
@@ -794,7 +799,27 @@ static void cash_autotune_fn(struct work_struct *work)
 	new_aggro = (cur_aggro * 7 + target_aggro) / 8;
 	WRITE_ONCE(sched_cash_aggro_ns, new_aggro);
 
-reschedule:
+	schedule_delayed_work(&cash_autotune_work, msecs_to_jiffies(100));
+}
+
+/*
+ * (Re)start the autotuner if it should be running. Resets the sample
+ * baseline so the first delta after a pause isn't one huge interval.
+ * Caller holds sched_cash_enable_mutex.
+ */
+static void cash_autotune_kick(void)
+{
+	struct cash_stats snap;
+
+	if (!READ_ONCE(cash_autotune_ready) ||
+	    !READ_ONCE(sched_cash_enabled) || !READ_ONCE(sched_cash_autotune))
+		return;
+	if (delayed_work_pending(&cash_autotune_work))
+		return;
+
+	cash_stats_sum(&snap);
+	prev_total_placements = snap.total_placements;
+	prev_migrations = snap.migrations;
 	schedule_delayed_work(&cash_autotune_work, msecs_to_jiffies(100));
 }
 
@@ -857,6 +882,7 @@ void sched_cash_init(void)
 	pr_info("sched_cash: initialized (cash_up=%d)\n", READ_ONCE(cash_up));
 
 	INIT_DELAYED_WORK(&cash_autotune_work, cash_autotune_fn);
+	WRITE_ONCE(cash_autotune_ready, true);
 	schedule_delayed_work(&cash_autotune_work, msecs_to_jiffies(250));
 	return;
 
@@ -887,7 +913,24 @@ static int sched_cash_enabled_handler(const struct ctl_table *table, int dir,
 			static_branch_enable(&sched_cash_on);
 		else
 			static_branch_disable(&sched_cash_on);
+		cash_autotune_kick();
 	}
+	mutex_unlock(&sched_cash_enable_mutex);
+	return ret;
+}
+
+static int sched_cash_autotune_handler(const struct ctl_table *table, int dir,
+				       void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+
+	if (!SYSCTL_USER_TO_KERN(dir))
+		return proc_douintvec_minmax(table, dir, buffer, lenp, ppos);
+
+	mutex_lock(&sched_cash_enable_mutex);
+	ret = proc_douintvec_minmax(table, dir, buffer, lenp, ppos);
+	if (!ret)
+		cash_autotune_kick();
 	mutex_unlock(&sched_cash_enable_mutex);
 	return ret;
 }
@@ -989,7 +1032,7 @@ static const struct ctl_table sched_cash_sysctls[] = {
 		.data = &sched_cash_autotune,
 		.maxlen = sizeof(unsigned int),
 		.mode = 0644,
-		.proc_handler = proc_douintvec_minmax,
+		.proc_handler = sched_cash_autotune_handler,
 		.extra1 = SYSCTL_ZERO,
 		.extra2 = SYSCTL_ONE,
 	},

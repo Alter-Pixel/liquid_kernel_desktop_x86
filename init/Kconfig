@@ -1546,27 +1546,38 @@ config SCHED_CASH
 	depends on !CPUMASK_OFFSTACK
 	depends on !ENERGY_MODEL
 	help
-	  Enable Cache-Aware Scheduling Heuristic (CASH) for improved task
-	  placement based on CPU cache locality. CASH reduces cache misses
-	  by preferring to schedule tasks on CPUs where their data is still
-	  warm in cache.
+	  CASH replaces the CFS wakeup placement (select_task_rq) with a
+	  heuristic tuned for desktops: woken tasks go to an idle CPU
+	  (preferring a fully idle core) as soon as one is available, and
+	  synchronous wakeup chains (pipes, sockets, ping-pong IPC) are kept
+	  on the waker's CPU when it is already busy so they batch work.
 
-	  Features:
-	  - Per-task cache warmness tracking
-	  - SMT sibling preference (same physical core = hot L1/L2)
-	  - Cluster/CCX awareness for AMD Zen and Intel hybrid CPUs
-	  - Dynamic scheduling group factors with EWMA smoothing
-	  - Statistics at /proc/sched_cash_stats (write to reset)
+	  Measured on a single-L3 Ryzen 8C/16T against a CONFIG_SCHED_CASH=n
+	  kernel:
+	  - a latency-sensitive task's p99 request latency while a -j16
+	    kernel build runs is about 46% lower; build time is unchanged
+	  - synchronous IPC (hackbench pipes) is about 10% faster
+	  - normal-load latency and throughput (schbench) are unchanged
+	  It does NOT measurably reduce cache misses; the gains come from
+	  faster idle-CPU pickup and wakeup batching. It migrates tasks
+	  2-6x more often, which is cheap with one shared L3 but is untested
+	  on CPUs with several L3s (multi-CCD) and on hybrid P/E-core CPUs.
+	  Power use has not been measured.
 
-	  Tunables via /proc/sys/kernel/:
-	  - sched_cash_aggro_ns:  aggressive cache-hot threshold (5ms)
-	  - sched_cash_tempo_ns:  moderate cache-hot threshold (12ms)
-	  - sched_cash_warm_ns:   cache warm window duration (20ms)
-	  - sched_cash_smt_bonus: score bonus for SMT siblings
-	  - sched_cash_cluster_bonus: score bonus for same cluster
+	  Runtime control in /proc/sys/kernel/:
+	  - sched_cash_enabled: 0 hands placement back to CFS; the hot-path
+	    hooks are then patched out via a static key and the kernel
+	    behaves like CONFIG_SCHED_CASH=n
+	  - sched_cash_idle_first, sched_cash_core_aware, sched_cash_scan_wrap,
+	    sched_cash_smt_penalty: slow-path placement (default on)
+	  - sched_cash_sync_coloc: WF_SYNC co-location (1 = default)
+	  - sched_cash_aggro_ns, sched_cash_tempo_ns, sched_cash_warm_ns,
+	    sched_cash_smt_bonus, sched_cash_cluster_bonus, sched_cash_autotune
+	  Statistics and placement counters: /proc/sched_cash_stats (write
+	  to reset).
 
-	  This is ideal for desktop, gaming, and latency-sensitive workloads.
-	  If unsure, say Y for desktop systems with multi-core CPUs.
+	  If unsure, say N. On a single-L3 desktop or laptop that compiles
+	  or runs heavy jobs while in use, Y is reasonable.
 
 config RELAY
 	bool "Kernel->user space relay support (formerly relayfs)"

@@ -22,6 +22,8 @@ static unsigned int sched_cash_warm_ns __read_mostly = 20000000;
 static unsigned int sched_cash_smt_bonus __read_mostly = 128;
 static unsigned int sched_cash_cluster_bonus __read_mostly = 64;
 static unsigned int sched_cash_enabled __read_mostly = 1;
+DEFINE_STATIC_KEY_TRUE(sched_cash_on);
+static DEFINE_MUTEX(sched_cash_enable_mutex);
 
 /*
  * Slow-path placement controls. core_aware, scan_wrap and idle_first are on
@@ -388,9 +390,12 @@ static bool cash_llc_has_idle(int cpu, const struct cpumask *scope)
 static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu,
 				    int wake_flags)
 {
-	/* Acquire cash_up topology state and check global toggle */
-	if (unlikely(!smp_load_acquire(&cash_up) ||
-		     !READ_ONCE(sched_cash_enabled)))
+	/* Global toggle first: a patched-out jump when CASH is disabled. */
+	if (!static_branch_likely(&sched_cash_on))
+		return select_task_rq_fair(p, prev_cpu, wake_flags);
+
+	/* Acquire cash_up topology state */
+	if (unlikely(!smp_load_acquire(&cash_up)))
 		return select_task_rq_fair(p, prev_cpu, wake_flags);
 
 	if ((p->flags & PF_KTHREAD) || rt_task(p) || p->prio < DEFAULT_PRIO)
@@ -863,13 +868,37 @@ free_masks:
 }
 
 #ifdef CONFIG_SYSCTL
+/*
+ * Keep the sched_cash_on static key in step with kernel.sched_cash_enabled.
+ * The mutex serialises writers so the key and the value cannot disagree.
+ */
+static int sched_cash_enabled_handler(const struct ctl_table *table, int dir,
+				      void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+
+	if (!SYSCTL_USER_TO_KERN(dir))
+		return proc_douintvec_minmax(table, dir, buffer, lenp, ppos);
+
+	mutex_lock(&sched_cash_enable_mutex);
+	ret = proc_douintvec_minmax(table, dir, buffer, lenp, ppos);
+	if (!ret) {
+		if (READ_ONCE(sched_cash_enabled))
+			static_branch_enable(&sched_cash_on);
+		else
+			static_branch_disable(&sched_cash_on);
+	}
+	mutex_unlock(&sched_cash_enable_mutex);
+	return ret;
+}
+
 static const struct ctl_table sched_cash_sysctls[] = {
 	{
 		.procname = "sched_cash_enabled",
 		.data = &sched_cash_enabled,
 		.maxlen = sizeof(unsigned int),
 		.mode = 0644,
-		.proc_handler = proc_douintvec_minmax,
+		.proc_handler = sched_cash_enabled_handler,
 		.extra1 = SYSCTL_ZERO,
 		.extra2 = SYSCTL_ONE,
 	},

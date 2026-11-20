@@ -10491,7 +10491,8 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 	struct sched_entity *nse = NULL;
 
 #ifdef CONFIG_SCHED_CASH
-	smp_store_release(&prev->last_ts, sched_clock());
+	if (static_branch_likely(&sched_cash_on))
+		smp_store_release(&prev->last_ts, sched_clock());
 #endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED

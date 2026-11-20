@@ -4266,6 +4266,12 @@ DEFINE_CLASS_IS_UNCONDITIONAL(sched_change)
 #include "ext/ext.h"
 
 #ifdef CONFIG_SCHED_CASH
+/*
+ * Mirrors kernel.sched_cash_enabled. A static key so that with CASH
+ * disabled the hot-path hooks (put_prev_task_fair, select_task_rq) are a
+ * patched-out jump and the scheduler runs the same code as CONFIG_SCHED_CASH=n.
+ */
+DECLARE_STATIC_KEY_TRUE(sched_cash_on);
 extern bool cash_up __read_mostly;
 extern bool cash_sg __read_mostly;
 void sched_cash_init(void);

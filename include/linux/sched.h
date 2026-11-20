@@ -930,13 +930,6 @@ struct task_struct {
 	unsigned int			core_occupation;
 #endif
 
-#ifdef CONFIG_SCHED_CASH
-	u64				last_ts;
-	int				cash_warm_cpu;	  /* CPU where cache is warm */
-	u64				cash_warm_until;  /* timestamp when cache goes cold */
-	u32				cash_migrations;  /* migration count for stats */
-#endif
-
 #ifdef CONFIG_CGROUP_SCHED
 	struct task_group		*sched_task_group;
 #ifdef CONFIG_CFS_BANDWIDTH
@@ -1718,6 +1711,18 @@ struct task_struct {
 
 	/* CPU-specific state of this task: */
 	struct thread_struct		thread;
+
+#ifdef CONFIG_SCHED_CASH
+	/*
+	 * Kept at the very end so that every other field sits at the same
+	 * offset as in a CONFIG_SCHED_CASH=n kernel (x86 FPU state lives after
+	 * the struct, so thread_struct does not need to be last).
+	 */
+	u64				last_ts;
+	u64				cash_warm_until;  /* timestamp when cache goes cold */
+	int				cash_warm_cpu;	  /* CPU where cache is warm */
+	u32				cash_migrations;  /* migration count for stats */
+#endif
 
 	/*
 	 * New fields for task_struct should be added above here, so that

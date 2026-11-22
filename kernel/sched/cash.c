@@ -49,6 +49,16 @@ static unsigned int sched_cash_core_aware __read_mostly = 1;
 static unsigned int sched_cash_scan_wrap __read_mostly = 1;
 static unsigned int sched_cash_sync_coloc __read_mostly = 1;
 static unsigned int sched_cash_idle_first __read_mostly = 1;
+/*
+ * group_narrow: cold wakeups scan only prev_cpu's sched_group when the
+ * topology has groups wider than an SMT pair (cash_sg). On a hybrid CPU
+ * (e.g. 4P+4E) that group is just prev_cpu's own core on the P side, so
+ * with idle_first an empty group widens to the whole scope.
+ * 0 (default) = never narrow (scan the whole scope),
+ * 1 = narrow, widen if the group has no idle CPU.
+ * On a Core 5 210H, 1 and 0 measured the same; 0 keeps the simpler path.
+ */
+static unsigned int sched_cash_group_narrow __read_mostly;
 static unsigned int sched_cash_smt_penalty __read_mostly = 256;
 static unsigned int cash_factor_max = SCHED_CAPACITY_SCALE;
 
@@ -79,6 +89,8 @@ struct cash_stats {
 	u64 busy_sibling_picks;	/* chosen CPU had a busy SMT sibling */
 	u64 idle_core_skipped;	/* ...while a fully idle core was scanned */
 	u64 busy_pick_idle_seen; /* chose a busy CPU while an idle one was scanned */
+	u64 group_narrowed;	/* slow scans that started on one sched_group */
+	u64 group_widened;	/* ...that found no idle CPU there and widened */
 };
 
 static DEFINE_PER_CPU(struct cash_stats, cash_stats);
@@ -104,6 +116,8 @@ static void cash_stats_sum(struct cash_stats *out)
 		out->busy_sibling_picks += s->busy_sibling_picks;
 		out->idle_core_skipped += s->idle_core_skipped;
 		out->busy_pick_idle_seen += s->busy_pick_idle_seen;
+		out->group_narrowed += s->group_narrowed;
+		out->group_widened += s->group_widened;
 	}
 }
 
@@ -420,6 +434,7 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu,
 	int scan_start, sib_ignore;
 	unsigned int smt_penalty;
 	bool multi_cluster, core_aware, saw_idle_core, saw_idle, idle_first;
+	bool narrowed = false, group_narrow;
 	u64 now;
 
 	if (unlikely(!cpumask_and(m_scope, cpu_active_mask, p->cpus_ptr)))
@@ -539,6 +554,7 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu,
 
 	core_aware = READ_ONCE(sched_cash_core_aware);
 	idle_first = READ_ONCE(sched_cash_idle_first);
+	group_narrow = READ_ONCE(cash_sg) && READ_ONCE(sched_cash_group_narrow);
 	smt_penalty = READ_ONCE(sched_cash_smt_penalty);
 	sib_ignore = p_que ? p_cpu : -1;
 	scan_start = (READ_ONCE(sched_cash_scan_wrap) && prev_cpu >= 0 &&
@@ -546,12 +562,16 @@ static int cash_select_task_rq_fair(struct task_struct *p, int prev_cpu,
 
 retry:
 	if (!aggro) {
-		if (READ_ONCE(cash_sg) && !tempo)
+		if (group_narrow && !tempo) {
 			cpumask_copy(m_group,
 				     cash_find_group(prev_cpu, wake_flags,
 						     m_scope));
-		else
+			if (!narrowed)
+				this_cpu_inc(cash_stats.group_narrowed);
+			narrowed = true;
+		} else {
 			cpumask_copy(m_group, m_scope);
+		}
 	}
 
 rescan:
@@ -640,13 +660,15 @@ rescan:
 
 	/*
 	 * idle_first: never queue behind running work when an idle CPU was
-	 * scanned. If the narrow aggro group had none, widen the scan once
-	 * (the aggro retry below drops to tempo, i.e. the full scope).
+	 * scanned. If the narrow aggro group, or the narrow sched_group, had
+	 * none, widen the scan once (tempo = the full scope).
 	 */
 	if (idle_first) {
-		if (best_idle.cpu >= 0)
+		if (best_idle.cpu >= 0) {
 			best = best_idle;
-		else if (aggro) {
+		} else if (aggro || (narrowed && !tempo)) {
+			if (!aggro)
+				this_cpu_inc(cash_stats.group_widened);
 			aggro = 0;
 			tempo = 1;
 			goto retry;
@@ -697,7 +719,7 @@ rescan:
 		goto retry;
 	}
 
-	if (!READ_ONCE(cash_sg))
+	if (!group_narrow)
 		goto done;
 
 	if (!aggro) {
@@ -1019,6 +1041,15 @@ static const struct ctl_table sched_cash_sysctls[] = {
 		.extra2 = SYSCTL_ONE,
 	},
 	{
+		.procname = "sched_cash_group_narrow",
+		.data = &sched_cash_group_narrow,
+		.maxlen = sizeof(unsigned int),
+		.mode = 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1 = SYSCTL_ZERO,
+		.extra2 = SYSCTL_ONE,
+	},
+	{
 		.procname = "sched_cash_smt_penalty",
 		.data = &sched_cash_smt_penalty,
 		.maxlen = sizeof(unsigned int),
@@ -1078,10 +1109,13 @@ static int cash_proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "busy_sibling_picks %llu\n", snap.busy_sibling_picks);
 	seq_printf(m, "idle_core_skipped %llu\n", snap.idle_core_skipped);
 	seq_printf(m, "busy_pick_idle_seen %llu\n", snap.busy_pick_idle_seen);
+	seq_printf(m, "group_narrowed %llu\n", snap.group_narrowed);
+	seq_printf(m, "group_widened %llu\n", snap.group_widened);
 	seq_printf(m, "core_aware %u\n", READ_ONCE(sched_cash_core_aware));
 	seq_printf(m, "scan_wrap %u\n", READ_ONCE(sched_cash_scan_wrap));
 	seq_printf(m, "sync_coloc %u\n", READ_ONCE(sched_cash_sync_coloc));
 	seq_printf(m, "idle_first %u\n", READ_ONCE(sched_cash_idle_first));
+	seq_printf(m, "group_narrow %u\n", READ_ONCE(sched_cash_group_narrow));
 	seq_printf(m, "smt_penalty %u\n", READ_ONCE(sched_cash_smt_penalty));
 
 	return 0;

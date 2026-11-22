@@ -1556,13 +1556,23 @@ config SCHED_CASH
 	  kernel:
 	  - a latency-sensitive task's p99 request latency while a -j16
 	    kernel build runs is about 46% lower; build time is unchanged
-	  - synchronous IPC (hackbench pipes) is about 10% faster
+	  - synchronous IPC (hackbench pipes) is about 10% faster and uses
+	    about 10% less energy
 	  - normal-load latency and throughput (schbench) are unchanged
+	  - idle and light-load battery power are unchanged
 	  It does NOT measurably reduce cache misses; the gains come from
 	  faster idle-CPU pickup and wakeup batching. It migrates tasks
-	  2-6x more often, which is cheap with one shared L3 but is untested
-	  on CPUs with several L3s (multi-CCD) and on hybrid P/E-core CPUs.
-	  Power use has not been measured.
+	  2-6x more often, which is cheap with one shared L3.
+
+	  Measured on an Intel hybrid Core 5 210H (4P+4E) against
+	  sched_cash_enabled=0 in the same boot:
+	  - schbench p99 request latency is about 5% lower
+	  - hackbench is about 5% faster with turbo headroom, but about 2.5%
+	    slower (and uses 2.5% more energy) at a fixed package power limit
+	  - deep idle residency drops by 6-9 points; package and battery
+	    power were unchanged on that machine (acpi_idle, pcie_aspm=off),
+	    which may hide a cost on systems that reach deeper package states
+	  Untested on CPUs with several L3s (multi-CCD).
 
 	  Runtime control in /proc/sys/kernel/:
 	  - sched_cash_enabled: 0 hands placement back to CFS; the hot-path
@@ -1571,13 +1581,16 @@ config SCHED_CASH
 	  - sched_cash_idle_first, sched_cash_core_aware, sched_cash_scan_wrap,
 	    sched_cash_smt_penalty: slow-path placement (default on)
 	  - sched_cash_sync_coloc: WF_SYNC co-location (1 = default)
+	  - sched_cash_group_narrow: scan only prev_cpu's sched_group on
+	    cold wakeups (0 = default; only matters with clustered cores)
 	  - sched_cash_aggro_ns, sched_cash_tempo_ns, sched_cash_warm_ns,
 	    sched_cash_smt_bonus, sched_cash_cluster_bonus, sched_cash_autotune
 	  Statistics and placement counters: /proc/sched_cash_stats (write
 	  to reset).
 
 	  If unsure, say N. On a single-L3 desktop or laptop that compiles
-	  or runs heavy jobs while in use, Y is reasonable.
+	  or runs heavy jobs while in use, Y is reasonable. On hybrid CPUs
+	  the gain is small and mostly in latency.
 
 config RELAY
 	bool "Kernel->user space relay support (formerly relayfs)"
